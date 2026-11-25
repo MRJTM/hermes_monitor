@@ -385,12 +385,14 @@ function renderChips() {
 $("#chips").addEventListener("click", e => { const c = e.target.closest(".chip"); if (!c) return; const s = document.getElementById("inst-" + c.dataset.id); if (s) s.scrollIntoView({ behavior: "smooth", block: "start" }); });
 setInterval(renderChips, 1000);
 
-function renderInsp(ins) {
+function renderInsp(ins, stats) {
   if (!ins) return;
   const box = $("#insp"), pre = $("#inspText"), meta = $("#inspMeta");
   if (ins.text && pre.dataset.t !== String(ins.ts)) { pre.textContent = ins.text; pre.dataset.t = ins.ts; }
   const when = ins.ts ? new Date(ins.ts * 1000).toLocaleTimeString("zh-CN", { hour12: false }) : "";
-  meta.textContent = ins.error ? "巡检失败：" + ins.error : (when ? `更新于 ${when} · ${ins.model || ""}` : "等待首次巡检…");
+  const cost = stats && stats.calls !== undefined
+    ? ` · LLM 调用 ${stats.calls} 次 / 跳过 ${stats.skipped} 次（仅树变化时调用）` : "";
+  meta.textContent = (ins.error ? "巡检失败：" + ins.error : (when ? `更新于 ${when} · ${ins.model || ""}` : "等待首次巡检…")) + cost;
   box.classList.toggle("err", !!ins.error);
 }
 $("#inspBar").onclick = () => {
@@ -449,7 +451,7 @@ async function poll() {
         for (const t of i.tasks) { if (t.id === state.sel) openSide(t, "task", now); for (const l of t.leaves) if (l.id === state.sel) openSide(l, "leaf", now); }
       }
     }
-    renderInsp(state.snap.inspect);
+    renderInsp(state.snap.inspect, state.snap.stats);
     render();
   } catch (e) { fails++; $("#live").className = "live bad"; $("#liveTxt").textContent = "连接失败，重试中…"; }
   setTimeout(poll, fails > 3 ? 6000 : 3000);

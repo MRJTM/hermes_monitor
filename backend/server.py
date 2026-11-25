@@ -1424,6 +1424,12 @@ _snapshot = {"ts": 0, "instances": [], "window_hours": WINDOW_H}
 _lock = threading.Lock()
 
 # ---------------------------------------------------------------- 后台巡检摘要
+# 巡检节奏：只在“树发生变化（新节点/节点信息变化）”时才调 LLM；
+# 无变化时只做本地指纹比对，不消耗 API。
+INSPECT_POLL_S = float(os.environ.get("INSPECT_POLL_S", "30"))          # 本地比对周期
+INSPECT_DEBOUNCE_S = float(os.environ.get("INSPECT_DEBOUNCE_S", "15"))  # 变化后合并抖动
+INSPECT_MIN_INTERVAL_S = float(os.environ.get("INSPECT_MIN_INTERVAL_S", "300"))  # 两次 LLM 调用最小间隔
+INSPECT_IDLE_REFRESH_S = float(os.environ.get("INSPECT_IDLE_REFRESH_S", "0"))    # >0 时按此周期做空闲兜底刷新
 INSPECT_S = float(os.environ.get("INSPECT_S", "600"))
 INSPECT_FILE = os.path.join(DATA_DIR, "inspect.json")
 LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:4000/v1/chat/completions")
@@ -1672,6 +1678,9 @@ def summarize_titles():
               "只输出一个 JSON 数组，长度与任务条数相同，例如 [\"修复登录超时\", \"评估特征重要性\"]。\n\n"
               + listing)
     try:
+        _LLM_STATS["titles"] += 1
+        _LLM_STATS["calls"] += 1
+        _LLM_STATS["last_call_ts"] = time.time()
         text = llm_chat(prompt, max_tokens=1500, temperature=0.2, timeout=90)
     except Exception as e:
         print("title llm error:", e, file=sys.stderr, flush=True)
@@ -1707,6 +1716,35 @@ def title_loop():
         time.sleep(5.0 if n >= 8 else max(20.0, TITLE_S))
 
 
+_LLM_STATS = {"calls": 0, "skipped": 0, "titles": 0, "last_reason": "", "last_call_ts": 0.0}
+_last_inspected_sig = None
+
+
+def tree_signature(snap):
+    """树的内容指纹：实例/任务/工人的 id + 状态 + 文案。变了才值得花一次 LLM。"""
+    parts = []
+    for i in (snap or {}).get("instances", []):
+        parts.append("I%s:%d" % (i.get("id"), 1 if i.get("alive") else 0))
+        for t in i.get("tasks", []):
+            parts.append("T%s:%s:%s" % (t.get("id"), t.get("status"), (t.get("rawTitle") or "")[:60]))
+            for l in t.get("leaves", []):
+                doing = ((l.get("doing") or {}).get("now") or "")[:80]
+                parts.append("L%s:%s:%s" % (l.get("id"), l.get("status"), doing))
+    return hashlib.sha1("\n".join(parts).encode("utf-8", "ignore")).hexdigest()
+
+
+def has_live_work(snap):
+    for i in (snap or {}).get("instances", []):
+        for t in i.get("tasks", []):
+            if t.get("status") == "running" or any(l.get("status") == "running" for l in t.get("leaves", [])):
+                return True
+    return False
+
+
+def llm_stats():
+    return dict(_LLM_STATS)
+
+
 def inspect_digest():
     with _lock:
         snap = _snapshot
@@ -1732,6 +1770,8 @@ def run_inspect():
               "2) 风险：卡住/中断/失败/长时间无动静的，点名到具体工人；\n"
               "3) 建议：下一步该盯什么。\n"
               "只依据数据，不要编造；总长 200-400 字。\n\n" + digest)
+    _LLM_STATS["calls"] += 1
+    _LLM_STATS["last_call_ts"] = time.time()
     try:
         text = llm_chat(prompt, max_tokens=1200, temperature=0.3, timeout=90)
         with _inspect_lock:
@@ -1757,13 +1797,38 @@ def inspect_loop():
             _inspect.update({k: o[k] for k in ("ts", "text", "error") if k in o})
     except Exception:
         pass
+    global _last_inspected_sig
     time.sleep(20)
     while True:
+        reason = ""
         try:
-            run_inspect()
+            with _lock:
+                snap = _snapshot
+            sig = tree_signature(snap)
+            now = time.time()
+            since_call = now - (_LLM_STATS["last_call_ts"] or 0.0)
+            if sig != _last_inspected_sig:
+                if since_call < INSPECT_MIN_INTERVAL_S:
+                    reason = "changed-but-cooling"
+                else:
+                    reason = "tree-changed"
+            elif INSPECT_IDLE_REFRESH_S > 0 and has_live_work(snap) and since_call >= INSPECT_IDLE_REFRESH_S:
+                reason = "idle-refresh"
+            if reason in ("tree-changed", "idle-refresh"):
+                time.sleep(INSPECT_DEBOUNCE_S)      # 合并同一批变化，避免连发
+                with _lock:
+                    snap = _snapshot
+                _last_inspected_sig = tree_signature(snap)
+                _LLM_STATS["last_reason"] = reason
+                print("inspect call: %s (calls=%d skipped=%d)" % (reason, _LLM_STATS["calls"], _LLM_STATS["skipped"]),
+                      file=sys.stderr, flush=True)
+                run_inspect()
+            else:
+                _LLM_STATS["skipped"] += 1
+                _LLM_STATS["last_reason"] = reason or "no-change"
         except Exception as e:
             print("inspect loop error:", e, file=sys.stderr, flush=True)
-        time.sleep(max(60.0, INSPECT_S))
+        time.sleep(max(5.0, INSPECT_POLL_S))
 
 
 def build():
@@ -1804,7 +1869,8 @@ def build():
                     leaf["title"] = nw or ("%s 工人" % (leaf.get("harness") or leaf.get("kind") or "Claude"))
     with _inspect_lock:
         ins = dict(_inspect)
-    return {"ts": now, "window_hours": WINDOW_H, "instances": insts, "inspect": ins}
+    return {"ts": now, "window_hours": WINDOW_H, "instances": insts, "inspect": ins,
+            "stats": llm_stats()}
 
 
 def loop():
