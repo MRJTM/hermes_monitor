@@ -1481,15 +1481,23 @@ INSPECT_MIN_INTERVAL_S = float(os.environ.get("INSPECT_MIN_INTERVAL_S", "300")) 
 INSPECT_IDLE_REFRESH_S = float(os.environ.get("INSPECT_IDLE_REFRESH_S", "0"))    # >0 时按此周期做空闲兜底刷新
 INSPECT_S = float(os.environ.get("INSPECT_S", "600"))
 INSPECT_FILE = os.path.join(DATA_DIR, "inspect.json")
+INSPECT_SIG_FILE = os.path.join(DATA_DIR, "inspect_sig.json")
 LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:4000/v1/chat/completions")
 LLM_MODEL = os.environ.get("LLM_MODEL", "ali-deepseek-v4.1-flash-nothink")
-LLM_KEY = os.environ.get("LLM_KEY", "sk-modelhub-local-2026")
+LLM_KEY = os.environ.get("LLM_KEY", "")  # 只从 .env 读，源码里不留任何字面量 key
 _inspect = {"ts": 0, "text": "", "model": LLM_MODEL, "error": None}
 _inspect_lock = threading.Lock()
 
 TITLES_FILE = os.path.join(DATA_DIR, "task_titles.json")
 LEAF_FILE = os.path.join(DATA_DIR, "leaf_notes.json")
 TITLE_S = float(os.environ.get("TITLE_S", "60"))
+# 标题/工人摘要的 LLM 也只在「出现新节点」时调用：记住见过的节点指纹，
+# 没有新节点就完全不打模型；有但距上次不足 TITLE_MIN_INTERVAL_S 时也只等不调。
+TITLE_MIN_INTERVAL_S = float(os.environ.get("TITLE_MIN_INTERVAL_S", "120"))
+SEEN_NODES_FILE = os.path.join(DATA_DIR, "seen_nodes.json")
+_seen_nodes = set()
+_seen_lock = threading.Lock()
+
 _titles = {}
 _titles_lock = threading.Lock()
 _leaf_notes = {}
@@ -1497,6 +1505,8 @@ _leaf_lock = threading.Lock()
 
 
 def llm_chat(prompt, max_tokens=1200, temperature=0.3, timeout=90):
+    if not LLM_KEY:
+        raise RuntimeError("LLM_KEY 未配置：请在 .env 里设置 LLM_KEY")
     body = json.dumps({
         "model": LLM_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -1751,22 +1761,97 @@ def summarize_titles():
 
 
 def title_loop():
+    """标题 / 工人摘要：只在出现新节点时调 LLM，其余轮次纯本地扫表。
+
+    触发条件（全部满足才调）：
+      1) 相比上次见过的节点集合，出现了新节点（或同一节点的原文变了 → 指纹变）；
+      2) 距上次标题调用 ≥ TITLE_MIN_INTERVAL_S（默认 120s），防止一波新节点连发。
+    """
+    load_seen_nodes()
     time.sleep(8)
+    last_call = float(_LLM_STATS.get("title_call_ts") or 0.0)
     while True:
-        n = 0
+        sleep_s = max(20.0, TITLE_S)
         try:
-            n = summarize_titles()
+            with _lock:
+                snap = _snapshot
+            keys = node_keys(snap)
+            with _seen_lock:
+                new_keys = keys - _seen_nodes
+            now = time.time()
+            if not new_keys:
+                _LLM_STATS["title_skipped"] += 1
+                _LLM_STATS["title_reason"] = "no-new-node"
+            elif now - last_call < TITLE_MIN_INTERVAL_S:
+                _LLM_STATS["title_skipped"] += 1
+                _LLM_STATS["title_reason"] = "new-node-cooling"
+            else:
+                n = 0
+                try:
+                    n = summarize_titles()
+                except Exception as e:
+                    print("title loop error:", e, file=sys.stderr, flush=True)
+                try:
+                    n += summarize_leaf_notes()
+                except Exception as e:
+                    print("leaf loop error:", e, file=sys.stderr, flush=True)
+                last_call = _LLM_STATS["title_call_ts"] = time.time()
+                _LLM_STATS["title_calls"] += 1
+                _LLM_STATS["title_reason"] = "new-node(%d)" % len(new_keys)
+                with _seen_lock:
+                    _seen_nodes.update(keys)
+                save_seen_nodes()
+                print("title call: %s (title_calls=%d skipped=%d)"
+                      % (_LLM_STATS["title_reason"], _LLM_STATS["title_calls"],
+                         _LLM_STATS["title_skipped"]), file=sys.stderr, flush=True)
+                if n >= 8:
+                    sleep_s = 5.0
         except Exception as e:
             print("title loop error:", e, file=sys.stderr, flush=True)
-        try:
-            n += summarize_leaf_notes()
-        except Exception as e:
-            print("leaf loop error:", e, file=sys.stderr, flush=True)
-        time.sleep(5.0 if n >= 8 else max(20.0, TITLE_S))
+        time.sleep(sleep_s)
 
 
-_LLM_STATS = {"calls": 0, "skipped": 0, "titles": 0, "last_reason": "", "last_call_ts": 0.0}
+_LLM_STATS = {"calls": 0, "skipped": 0, "titles": 0, "last_reason": "", "last_call_ts": 0.0,
+              "title_calls": 0, "title_skipped": 0, "title_reason": "", "title_call_ts": 0.0}
 _last_inspected_sig = None
+
+
+def node_keys(snap):
+    """当前树上所有节点的指纹（任务 id+原文 hash、工人 id+指令 hash）。
+
+    用于「只对新节点调 LLM」：指纹集合没有新增元素时，标题/工人摘要一律不调用。
+    """
+    keys = set()
+    for i in (snap or {}).get("instances", []):
+        for t in (i.get("tasks") or []):
+            keys.add("T:%s:%s" % (t.get("id"), _title_hash(t.get("rawTitle") or t.get("title") or "")))
+            for l in (t.get("leaves") or []):
+                keys.add("L:%s:%s" % (l.get("id"), _title_hash(l.get("prompt") or l.get("title") or "")))
+    return keys
+
+
+def load_seen_nodes():
+    try:
+        with open(SEEN_NODES_FILE) as f:
+            o = json.load(f)
+        if isinstance(o, list):
+            with _seen_lock:
+                _seen_nodes.clear()
+                _seen_nodes.update(str(x) for x in o)
+    except Exception:
+        pass
+
+
+def save_seen_nodes():
+    try:
+        with _seen_lock:
+            data = list(_seen_nodes)[-20000:]
+        tmp = SEEN_NODES_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, SEEN_NODES_FILE)
+    except Exception:
+        pass
 
 
 def tree_signature(snap):
@@ -1847,6 +1932,15 @@ def inspect_loop():
     except Exception:
         pass
     global _last_inspected_sig
+    # 重启后不要因为内存里没有指纹就白打一次 LLM：从磁盘恢复上次巡检的指纹
+    try:
+        with open(INSPECT_SIG_FILE) as f:
+            sig_state = json.load(f)
+        _last_inspected_sig = sig_state.get("sig") or None
+        if sig_state.get("ts"):
+            _LLM_STATS["last_call_ts"] = float(sig_state["ts"])
+    except Exception:
+        pass
     time.sleep(20)
     while True:
         reason = ""
@@ -1868,6 +1962,11 @@ def inspect_loop():
                 with _lock:
                     snap = _snapshot
                 _last_inspected_sig = tree_signature(snap)
+                try:
+                    with open(INSPECT_SIG_FILE, "w") as f:
+                        json.dump({"sig": _last_inspected_sig, "ts": time.time()}, f)
+                except Exception:
+                    pass
                 _LLM_STATS["last_reason"] = reason
                 print("inspect call: %s (calls=%d skipped=%d)" % (reason, _LLM_STATS["calls"], _LLM_STATS["skipped"]),
                       file=sys.stderr, flush=True)
@@ -2008,6 +2107,8 @@ class H(BaseHTTPRequestHandler):
         if not self._authed():
             return self._json(401, {"error": "需要 X-Monitor-Token（见 data/.token）"})
         if path == "/api/inspect":
+            print("inspect call: http-manual (calls=%d)" % (_LLM_STATS["calls"] + 1),
+                  file=sys.stderr, flush=True)
             return self._json(200, run_inspect())
         try:
             n = int(self.headers.get("Content-Length") or 0)

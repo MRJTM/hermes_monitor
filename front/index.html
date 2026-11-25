@@ -391,7 +391,9 @@ function renderInsp(ins, stats) {
   if (ins.text && pre.dataset.t !== String(ins.ts)) { pre.textContent = ins.text; pre.dataset.t = ins.ts; }
   const when = ins.ts ? new Date(ins.ts * 1000).toLocaleTimeString("zh-CN", { hour12: false }) : "";
   const cost = stats && stats.calls !== undefined
-    ? ` · LLM 调用 ${stats.calls} 次 / 跳过 ${stats.skipped} 次（仅树变化时调用）` : "";
+    ? ` · 巡检 LLM ${stats.calls} 次 / 跳过 ${stats.skipped} 次`
+      + (stats.title_calls !== undefined ? `；标题 LLM ${stats.title_calls} 次 / 跳过 ${stats.title_skipped} 次` : "")
+      + "（均只在新节点/树变化时调用）" : "";
   meta.textContent = (ins.error ? "巡检失败：" + ins.error : (when ? `更新于 ${when} · ${ins.model || ""}` : "等待首次巡检…")) + cost;
   box.classList.toggle("err", !!ins.error);
 }
