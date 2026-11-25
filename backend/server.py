@@ -147,8 +147,8 @@ def ancestors(pid, table):
 
 
 HARNESS_NAMES = {"claude": "Claude Code", "opencode": "opencode", "antigravity": "Antigravity"}
-_CLAUDE_TOKS = {"claude", "claude-real", "claude-native", "claude-gw"}
-_OPENCODE_TOKS = {"opencode"}
+_CLAUDE_TOKS = {"claude", "claude-real", "claude-native", "claude-gw", "ccd"}
+_OPENCODE_TOKS = {"opencode", "ocd"}
 _AGY_TOKS = {"antigravity", "agy"}
 
 
@@ -352,12 +352,15 @@ def split_shell(text):
 def find_harness_invocation(command):
     """命令里若真的在*启动*某个工人（而不是 echo/grep 提到它），返回
     {harness, mode, prompt, model, session?, title?, conversation?}，否则 None。"""
-    if not command or not any(k in command for k in ("claude", "opencode", "antigravity", "agy")):
+    if not command or not any(k in command for k in ("claude", "opencode", "antigravity", "agy", "ocd", "ccd")):
         return None
     body = _HEREDOC.sub(" ", command)                      # 去掉 heredoc 正文
     for seg in split_shell(body):
         seg = seg.strip()
         if not seg:
+            continue
+        # 代码片段（python/js 源码里提到 opencode、claude 等词）不算启动工人
+        if re.search(r"==|\)\s*\.get\(|\bdef\s|\bimport\s|\bprint\(|\blambda\b|\bjson\.", seg):
             continue
         try:
             toks = shlex.split(seg, posix=True)
@@ -397,6 +400,10 @@ def find_harness_invocation(command):
             sub = rest[0] if rest else ""
             if sub in _NON_RUN_SUB:
                 continue
+            if sub in ("-p", "--print"):
+                pos = _positionals(rest, 1)
+                return {"harness": "opencode", "mode": "run", "prompt": pos[0] if pos else "",
+                        "model": model, "session": _opt(rest, ("-s", "--session"))}
             if sub in ("run", "exec"):
                 pos = _positionals(rest, 1)
                 return {"harness": "opencode", "mode": "run", "prompt": pos[0] if pos else "",
@@ -992,9 +999,10 @@ def collect_instance(inst, procs, now, used_procs=None):
                         args = json.loads(fn.get("arguments") or "{}")
                     except Exception:
                         args = {}
-                    if name not in ("terminal", "process_manage", "execute_code", "shell", "bash"):
+                    # 只认 shell 类工具的命令；execute_code 里出现的 opencode/claude 是源码字符串，不是启动工人
+                    if name not in ("terminal", "process_manage", "shell", "bash"):
                         continue
-                    cmd = args.get("command") or args.get("code") or ""
+                    cmd = args.get("command") or ""
                     inv = find_harness_invocation(cmd)
                     if not inv:
                         continue
@@ -1883,6 +1891,33 @@ def build():
         except Exception as e:  # 单个实例出错不影响其它
             insts.append({"id": inst["id"], "name": inst.get("label") or inst["id"], "home": inst["home"],
                           "alive": False, "tasks": [], "error": f"{type(e).__name__}: {e}"})
+    # 任何实例都没认领的存活工人进程（手工在 shell / tmux 里起的 opencode、claude…）
+    leftovers = [p for p in procs.values() if is_harness_proc(p) and p["pid"] not in used]
+    if leftovers:
+        leaves = []
+        for p in leftovers:
+            h = harness_of_proc(p) or "claude"
+            inv = find_harness_invocation(" ".join(p["cmd"])) or {"mode": "process", "prompt": ""}
+            leaf = {
+                "id": f"proc:{p['pid']}", "kind": h, "harness": h, "mode": inv.get("mode", "process"),
+                "title": clip(redact(inv.get("title") or inv.get("prompt") or " ".join(p["cmd"][1:]) or h), 80),
+                "prompt": redact(inv.get("prompt") or "")[:3000],
+                "command": redact(" ".join(p["cmd"]))[:800], "cwd": p["cwd"],
+                "startedAt": p["start"], "endedAt": None, "status": "running", "pid": p["pid"],
+                "doing": None, "lastActivity": None, "model": inv.get("model", ""),
+                "session": inv.get("session", ""), "conversation": "", "titleHint": inv.get("title", ""),
+            }
+            leaves.append(leaf)
+            used.add(p["pid"])
+        insts.append({
+            "id": "unattributed", "name": "未归属工人", "home": "", "alive": True,
+            "pid": None, "gateway_state": "running", "active_agents": len(leaves), "error": None,
+            "state": "busy", "busy_since": min(l["startedAt"] for l in leaves), "rest_since": None,
+            "tasks": [{"id": "unattributed:orphan", "title": "后台 / 未归属的工人进程（不在任何 Hermes 实例下）",
+                       "text": "", "session": "", "chat": "", "chatType": "", "source": "process",
+                       "status": "running", "startedAt": min(l["startedAt"] for l in leaves),
+                       "endedAt": None, "lastTs": now, "toolCalls": 0, "final": None, "leaves": leaves}],
+        })
     with _titles_lock:
         tc = dict(_titles)
     for i in insts:
