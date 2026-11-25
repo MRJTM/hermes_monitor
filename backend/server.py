@@ -208,6 +208,36 @@ def discover_instances():
     return list(homes.values())
 
 
+def _proc_stat_start_time(pid):
+    """读 /proc/<pid>/stat 的第 22 列（进程启动时刻，单位 jiffies）。"""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read().decode("utf-8", "ignore")
+        # comm 里可能有空格/括号，按最后一个 ')' 之后切
+        tail = data[data.rfind(")") + 2:].split()
+        return int(tail[19])
+    except Exception:
+        return None
+
+
+def _gateway_lock_valid(pid, start_time, home):
+    """lock 可能是崩溃残留：pid 必须还活着，且（若记录了 start_time）必须是同一个进程。"""
+    if not os.path.isdir(f"/proc/{pid}"):
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read()
+    except Exception:
+        return False
+    if not cmdline.strip():
+        return False
+    if start_time:
+        st = _proc_stat_start_time(pid)
+        if st is not None and int(st) != int(start_time):
+            return False          # pid 被复用，lock 已过期
+    return True
+
+
 def gateway_pid(home):
     raw = _read(os.path.join(home, "gateway.pid"))
     if raw:
@@ -218,6 +248,17 @@ def gateway_pid(home):
                 return int(raw.strip())
             except Exception:
                 pass
+    # 新版 hermes 把 pid 写在 gateway.lock（JSON）：{"pid":..., "kind":"hermes-gateway",
+    # "argv":[...], "start_time":..., "hermes_home":...}
+    lock = _read(os.path.join(home, "gateway.lock"))
+    if lock:
+        try:
+            o = json.loads(lock)
+            pid = int(o.get("pid") or 0)
+            if pid > 0 and _gateway_lock_valid(pid, o.get("start_time"), home):
+                return pid
+        except Exception:
+            pass
     # 退而求其次：扫 /proc 找 HERMES_HOME 对得上的 gateway
     for d in os.listdir("/proc"):
         if d.isdigit():
@@ -859,7 +900,7 @@ def collect_instance(inst, procs, now, used_procs=None):
     home = inst["home"]
     gpid = gateway_pid(home)
     gst = load_state(home)
-    alive = bool(gpid and gpid in procs)
+    alive = bool(gpid and (gpid in procs or os.path.isdir(f"/proc/{gpid}")))
     out = {
         "id": inst["id"], "name": app_name_for(inst) or inst.get("label") or inst["id"], "home": home,
         "alive": alive, "pid": gpid, "gateway_state": gst.get("gateway_state"),
