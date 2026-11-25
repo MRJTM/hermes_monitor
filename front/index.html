@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermes 行为树</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2230; --muted: #6b7385; --line: #d5d9e2; --soft: #eef0f5;
+    --run: #2563eb; --run-bg: #e8f0ff;
+    --done: #16a34a; --done-bg: #e7f6ec;
+    --fail: #dc2626; --fail-bg: #fdeaea;
+    --stall: #d97706; --stall-bg: #fdf1dd;
+    --rest: #64748b; --rest-bg: #eef1f6;
+    --shadow: 0 1px 2px rgba(20,30,60,.06), 0 4px 14px rgba(20,30,60,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1218; --panel: #171b24; --ink: #e6e9f0; --muted: #8b94a8; --line: #2c3342; --soft: #1f2430;
+      --run: #5b9bff; --run-bg: #14233f; --done: #4cc476; --done-bg: #12281b;
+      --fail: #ff6b6b; --fail-bg: #351919; --stall: #f0a23b; --stall-bg: #35260f;
+      --rest: #8d9ab3; --rest-bg: #1d2330; --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 14px rgba(0,0,0,.3);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1218; --panel: #171b24; --ink: #e6e9f0; --muted: #8b94a8; --line: #2c3342; --soft: #1f2430;
+    --run: #5b9bff; --run-bg: #14233f; --done: #4cc476; --done-bg: #12281b;
+    --fail: #ff6b6b; --fail-bg: #351919; --stall: #f0a23b; --stall-bg: #35260f;
+    --rest: #8d9ab3; --rest-bg: #1d2330; --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 14px rgba(0,0,0,.3);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif; }
+  header { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--bg) 90%, transparent);
+    backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); padding: 10px 16px; display: grid; gap: 8px; }
+  .row1 { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center; }
+  h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  .legend, .controls { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; color: var(--muted); font-size: 12.5px; }
+  .controls { margin-left: auto; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; vertical-align: -1px; margin-right: 5px; }
+  .dot.run { background: var(--run); animation: ping 1.6s infinite; }
+  .dot.done { background: var(--done); } .dot.fail { background: var(--fail); }
+  .dot.stall { background: var(--stall); } .dot.rest { background: var(--rest); }
+  @keyframes ping { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--run) 60%, transparent); } 70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
+  .shape { display: inline-block; width: 22px; height: 12px; vertical-align: -2px; margin-right: 5px; border: 1.6px solid var(--muted); }
+  .shape.s-status { border-radius: 99px; border-width: 2.6px; }
+  .shape.s-task { border-radius: 5px; }
+  .shape.s-leaf { border-radius: 2px; border-style: dashed; }
+  .shape.s-root { border-radius: 6px; border-width: 2.6px; border-style: double; border-width: 4px; }
+  select, button { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 4px 9px; cursor: pointer; }
+  label.chk { display: inline-flex; gap: 5px; align-items: center; cursor: pointer; }
+  .live { display: inline-flex; align-items: center; gap: 6px; }
+  .live i { width: 8px; height: 8px; border-radius: 50%; background: var(--done); }
+  .live.bad i { background: var(--fail); }
+  /* 顶部：每个 Hermes 一个状态胶囊 */
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 12px; border: 1.6px solid var(--line);
+    background: var(--panel); cursor: pointer; font-size: 13px; }
+  .chip b { font-weight: 650; }
+  .chip small { color: var(--muted); font-size: 12px; }
+  .chip.busy { border-color: var(--run); background: var(--run-bg); } .chip.busy small { color: var(--run); }
+  .chip.rest { border-color: var(--rest); background: var(--rest-bg); }
+  .chip.offline { border-color: var(--fail); background: var(--fail-bg); } .chip.offline small { color: var(--fail); }
+  main { padding: 16px; display: grid; gap: 16px; }
+  section.inst { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; scroll-margin-top: 110px; }
+  .inst-head { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; padding: 11px 16px; border-bottom: 1px solid var(--line); }
+  .inst-head b { font-size: 15px; }
+  .pill { font-size: 12px; padding: 1px 9px; border-radius: 99px; background: var(--soft); color: var(--muted); }
+  .pill.run { background: var(--run-bg); color: var(--run); } .pill.fail { background: var(--fail-bg); color: var(--fail); }
+  .pill.stall { background: var(--stall-bg); color: var(--stall); } .pill.done { background: var(--done-bg); color: var(--done); }
+  .scroll { overflow: auto; padding: 8px 12px 14px; }
+  svg { display: block; }
+  .link { fill: none; stroke: var(--line); stroke-width: 1.6; }
+  .link.run { stroke: var(--run); stroke-dasharray: 5 5; animation: flow 1s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -10; } }
+  .node { cursor: pointer; }
+  .node rect.box { fill: var(--panel); stroke-width: 1.6; }
+  .node:hover rect.box { filter: drop-shadow(0 2px 6px rgba(0,0,0,.18)); }
+  .node.sel rect.box { stroke-width: 3; }
+  .node text { fill: var(--ink); pointer-events: none; }
+  .node .t1 { font-size: 12.5px; font-weight: 600; }
+  .node .t2 { font-size: 11px; fill: var(--muted); }
+  .node .t3 { font-size: 10.5px; fill: var(--muted); }
+  .node .chev { font-size: 13px; font-weight: 700; fill: var(--muted); }
+  /* 四种节点用四种边框 */
+  .t-root rect.box { stroke-width: 3.4; }                      /* 根：粗实线 */
+  .t-status rect.box { stroke-width: 2.8; }                    /* 状态：胶囊 + 粗线 */
+  .t-task rect.box { stroke-width: 1.6; }                      /* 任务：细实线圆角 */
+  .t-leaf rect.box { stroke-width: 1.7; stroke-dasharray: 6 3.5; } /* 工人：虚线直角 */
+  .leaf-ico { fill: none; }
+  .oc-p { fill: var(--ink); }
+  .insp { margin: 0 16px; }
+  .insp .bar { display:flex; gap:8px; align-items:center; padding:8px 12px; margin-top:8px; border:1px solid var(--line);
+    border-radius: 10px 10px 0 0; background: var(--panel); cursor:pointer; font-size:13px; }
+  .insp .bar b { font-weight: 650; }
+  .insp .bar small { color: var(--muted); }
+  .insp pre { display:none; margin:0; padding:10px 14px; border:1px solid var(--line); border-top:0; border-radius:0 0 10px 10px;
+    background: var(--panel); white-space: pre-wrap; word-break: break-word; font: 13px/1.65 ui-monospace, Menlo, monospace; max-height: 240px; overflow:auto; }
+  .insp.open pre { display:block; }
+  .insp.err .bar small { color: var(--fail); }
+  .st-run rect.box { stroke: var(--run); fill: var(--run-bg); }
+  .st-done rect.box { stroke: var(--done); }
+  .t-status.st-done rect.box { fill: var(--done-bg); }
+  .st-fail rect.box { stroke: var(--fail); fill: var(--fail-bg); }
+  .st-stall rect.box { stroke: var(--stall); fill: var(--stall-bg); }
+  .st-rest rect.box { stroke: var(--rest); fill: var(--rest-bg); }
+  .badge-run { fill: var(--run); } .badge-done { fill: var(--done); } .badge-fail { fill: var(--fail); } .badge-stall { fill: var(--stall); } .badge-rest { fill: var(--rest); }
+  .ring { fill: none; stroke: var(--run); stroke-width: 2; transform-origin: center; transform-box: fill-box; animation: spin 1.1s linear infinite; stroke-dasharray: 12 20; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .more { font-size: 12px; fill: var(--muted); cursor: pointer; }
+  .more:hover { fill: var(--run); }
+  .empty { color: var(--muted); padding: 22px; text-align: center; }
+  aside { position: fixed; right: 0; top: 0; bottom: 0; width: min(440px, 100vw); background: var(--panel);
+    border-left: 1px solid var(--line); box-shadow: -8px 0 30px rgba(0,0,0,.15); transform: translateX(105%);
+    transition: transform .18s; z-index: 10; display: flex; flex-direction: column; }
+  aside.open { transform: none; }
+  aside .bar { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  aside .body { padding: 14px 16px 30px; overflow: auto; }
+  aside h3 { margin: 16px 0 5px; font-size: 12px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  aside pre { margin: 0; white-space: pre-wrap; word-break: break-word; background: var(--soft); border-radius: 8px; padding: 9px 11px;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; max-height: 240px; overflow: auto; }
+  aside .kv { display: grid; grid-template-columns: 78px 1fr; gap: 3px 10px; font-size: 13px; }
+  aside .kv span:nth-child(odd) { color: var(--muted); }
+  ul.steps { margin: 0; padding-left: 18px; font: 12px/1.6 ui-monospace, Menlo, monospace; }
+  @media (max-width: 640px) { header { padding: 8px 12px; } main { padding: 10px; } .controls { margin-left: 0; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="row1">
+    <h1>Hermes 行为树</h1>
+    <div class="legend">
+      <span><i class="dot run"></i>进行中</span><span><i class="dot done"></i>已完成</span>
+      <span><i class="dot stall"></i>被中断</span><span><i class="dot fail"></i>失败/离线</span><span><i class="dot rest"></i>休息</span>
+      <span style="opacity:.5">|</span>
+      <span><i class="shape s-root"></i>Hermes</span><span><i class="shape s-status"></i>状态</span>
+      <span><i class="shape s-task"></i>任务</span><span><i class="shape s-leaf"></i>工人（Claude / opencode / Antigravity）</span>
+    </div>
+    <div class="controls">
+      <label>范围
+        <select id="win">
+          <option value="1">近 1 小时</option><option value="6">近 6 小时</option>
+          <option value="24" selected>近 24 小时</option><option value="168">近 7 天</option><option value="0">全部</option>
+        </select>
+      </label>
+      <label class="chk"><input type="checkbox" id="onlyRun"> 只看进行中</label>
+      <button id="expandAll" title="展开/折叠所有「已完成」">展开已完成</button>
+      <span class="live" id="live"><i></i><span id="liveTxt">连接中…</span></span>
+    </div>
+  </div>
+  <div class="chips" id="chips"></div>
+</header>
+<div class="insp" id="insp"><div class="bar" id="inspBar"><b>🧭 巡检摘要</b><small id="inspMeta">等待首次巡检…</small><span style="margin-left:auto">▾</span></div><pre id="inspText"></pre></div>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs><clipPath id="hm-r11"><rect width="44" height="44" rx="10"/></clipPath><symbol id="ico-oc" viewBox="0 0 240 300"><path class="oc-p" d="M180 240H60V120H180V240Z"/><path class="oc-p" d="M180 60H60V240H180V60ZM240 300H0V0H240V300Z"/></symbol><symbol id="ico-ag" viewBox="0 0 128 128"><image width="128" height="128" href="data:image/png;base64,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"/></symbol></defs></svg>
+<main id="main"><div class="empty">加载中…</div></main>
+<aside id="side"><div class="bar"><b id="sideTitle"></b><button id="sideClose">关闭</button></div><div class="body" id="sideBody"></div></aside>
+
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+const NS = "http://www.w3.org/2000/svg";
+const ST = { running: ["run", "进行中"], done: ["done", "已完成"], failed: ["fail", "失败"], stalled: ["stall", "已中断"] };
+const GROUPS = [ // 状态层：顺序即显示顺序
+  { key: "running", cls: "run", title: "正在运行中" },
+  { key: "stalled", cls: "stall", title: "被中断" },
+  { key: "done", cls: "done", title: "已完成" },
+];
+const W = { root: 196, status: 168, task: 276, leaf: 376 };
+const H = { root: 58, status: 50, task: 66, leaf: 88 };
+const GAPX = 50, GAPY = 12, GROUPGAP = 20, PAD = 14, CAP = 12;
+const state = { snap: null, recvAt: 0, sel: null, fold: {}, more: new Set(), win: 24, onlyRun: false };
+try {
+  state.win = +localStorage.getItem("hm.win") || 24; state.onlyRun = localStorage.getItem("hm.run") === "1";
+  state.fold = JSON.parse(localStorage.getItem("hm.fold") || "{}");
+} catch (e) {}
+$("#win").value = String(state.win); $("#onlyRun").checked = state.onlyRun;
+
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fit = (s, n) => { s = String(s || ""); let w = 0, o = ""; for (const ch of s) { w += ch.charCodeAt(0) > 255 ? 2 : 1; if (w > n) return o + "…"; o += ch; } return o; };
+const dur = s => { s = Math.max(0, Math.round(s)); if (s < 60) return s + "秒"; if (s < 3600) return Math.floor(s / 60) + "分" + String(s % 60).padStart(2, "0") + "秒"; if (s < 86400) return Math.floor(s / 3600) + "时" + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + "分"; return Math.floor(s / 86400) + "天" + Math.floor(s % 86400 / 3600) + "时"; };
+const p2 = n => String(n).padStart(2, "0");
+const clock = ts => { if (!ts) return "—"; const d = new Date(ts * 1000), t = new Date(); const hm = `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`; return d.toDateString() === t.toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`; };
+const full = ts => ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
+const nowTs = () => state.snap ? state.snap.ts + (Date.now() - state.recvAt) / 1000 : Date.now() / 1000;
+
+function el(tag, attrs = {}, parent) { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; }
+
+// 折叠：默认「已完成」折叠，其余展开；用户点过之后记住
+const foldKey = (inst, g) => inst.id + ":" + g;
+const isFolded = (inst, g) => { const v = state.fold[foldKey(inst, g)]; return v === undefined ? g === "done" : v; };
+function setFold(inst, g, v) { state.fold[foldKey(inst, g)] = v; try { localStorage.setItem("hm.fold", JSON.stringify(state.fold)); } catch (_) {} }
+
+// 时间描述：三种状态各自展示该展示的时间
+function timeLine(n, now) {
+  const st = n.status;
+  if (st === "running") return `启动 ${clock(n.startedAt)} · 已运行 ${dur(now - n.startedAt)}`;
+  if (st === "done") { const e = n.endedAt || n.lastTs || n.startedAt; return `完成 ${clock(e)} · ${dur(now - e)}前`; }
+  if (st === "failed") { const e = n.endedAt || n.startedAt; return `失败 ${clock(e)} · ${dur(now - e)}前`; }
+  const e = n.lastActivity || n.lastTs || n.endedAt || n.startedAt; return `中断 ${clock(e)} · ${dur(now - e)}前（启动 ${clock(n.startedAt)}）`;
+}
+
+const HARN = { claude: "Claude", opencode: "opencode", antigravity: "Antigravity", subagent: "子代理", process: "进程" };
+const STC = { run: "#2563eb", done: "#16a34a", fail: "#dc2626", stall: "#d97706", rest: "#64748b" };
+
+function iconMark(g, name, s, cls) {
+  const c = STC[cls] || STC.rest, m = s / 2, running = cls === "run";
+  const ring = () => { if (!running) return; const r = m + 4.5, C = 2 * Math.PI * r;
+    el("circle", { class: "ring", cx: m, cy: m, r, "stroke-dasharray": `${(C * .3).toFixed(1)} ${C.toFixed(1)}` }, g); };
+  const frame = () => { el("rect", { x: -2.5, y: -2.5, width: s + 5, height: s + 5, rx: 12,
+    fill: "none", stroke: running ? "var(--line)" : c, "stroke-width": 2.4 }, g); ring(); };
+  if (name === "opencode") { frame(); el("use", { href: "#ico-oc", width: s, height: s }, g); return; }
+  if (name === "antigravity") { frame(); el("use", { href: "#ico-ag", width: s, height: s }, g); return; }
+  if (name === "subagent") {
+    el("rect", { x: 0, y: 0, width: s, height: s, rx: 11, fill: "var(--panel)", stroke: running ? "var(--line)" : c, "stroke-width": 2.2 }, g); ring();
+    const t = el("text", { x: m, y: m + s * .16, fill: "#9775fa", "text-anchor": "middle", "font-size": s * .60 }, g);
+    t.textContent = "◈";
+  } else if (name === "claude") {
+    el("rect", { x: 0, y: 0, width: s, height: s, rx: 11, fill: "var(--panel)", stroke: running ? "var(--line)" : c, "stroke-width": 2.2 }, g);
+    ring();
+    for (let i = 0; i < 10; i++) {
+      const a = i * Math.PI / 5 - Math.PI / 2;
+      el("line", { x1: m + Math.cos(a) * s * .10, y1: m + Math.sin(a) * s * .10,
+        x2: m + Math.cos(a) * s * .34, y2: m + Math.sin(a) * s * .34,
+        stroke: "#D97757", "stroke-width": Math.max(1.6, s * .075), "stroke-linecap": "round" }, g);
+    }
+  } else {
+    el("rect", { x: 0, y: 0, width: s, height: s, rx: 11, fill: "var(--panel)", stroke: running ? "var(--line)" : c, "stroke-width": 2.2 }, g);
+    ring();
+    const t = el("text", { x: m, y: m + s * .12, fill: "var(--muted)", "text-anchor": "middle", "font-size": s * .40 }, g);
+    t.textContent = "›_";
+  }
+}
+
+function nodeBox(parent, o) {
+  const { x, y, w, h, type, cls, lines, onClick, sel, chev, icon } = o;
+  const g = el("g", { class: `node t-${type} st-${cls} ${sel ? "sel" : ""}`, transform: `translate(${x},${y})` }, parent);
+  el("rect", { class: "box", width: w, height: h, rx: type === "status" ? h / 2 : type === "leaf" ? 3 : type === "root" ? 14 : 10 }, g);
+  let bx;
+  if (type === "leaf" && icon) {
+    iconMark(el("g", { transform: `translate(14,${(h - 44) / 2})` }, g), icon, 44, cls);
+    bx = 56;
+  } else {
+    bx = type === "status" ? 20 : 17;
+    if (cls === "run") el("circle", { class: "ring", cx: bx, cy: h / 2, r: 7.5 }, g);
+    el("circle", { class: `badge-${cls}`, cx: bx, cy: h / 2, r: 4.6 }, g);
+  }
+  const n = lines.length, step = n === 3 ? (type === "leaf" ? 19 : 16) : 17,
+    y0 = h / 2 - ((n - 1) * step) / 2 + 4;
+  lines.forEach((t, i) => { const tx = el("text", { class: ["t1", "t2", "t3"][i], x: bx + 14, y: y0 + i * step }, g); tx.textContent = t; });
+  if (chev) { const c = el("text", { class: "chev", x: w - 24, y: h / 2 + 5 }, g); c.textContent = chev; }
+  g.addEventListener("click", ev => { ev.stopPropagation(); onClick(); });
+  return g;
+}
+
+function visibleTasks(inst, now) {
+  let tasks = inst.tasks.filter(t => state.win === 0 || now - (t.lastTs || t.startedAt) <= state.win * 3600 || t.status === "running");
+  if (state.onlyRun) tasks = tasks.filter(t => t.status === "running" || t.leaves.some(l => l.status === "running"));
+  return tasks;
+}
+
+function renderInstance(inst, now) {
+  const sec = document.createElement("section"); sec.className = "inst"; sec.id = "inst-" + inst.id;
+  const tasks = visibleTasks(inst, now);
+  const byStatus = { running: [], stalled: [], done: [] };
+  tasks.forEach(t => (byStatus[t.status] || byStatus.stalled).push(t));
+  const allLeaves = tasks.flatMap(t => t.leaves);
+  const nLeafRun = allLeaves.filter(l => l.status === "running").length;
+  const head = document.createElement("div"); head.className = "inst-head";
+  head.innerHTML = `<b>${esc(inst.name)}</b><span class="pill ${inst.alive ? "done" : "fail"}">${inst.alive ? "gateway 在线" : "gateway 离线"}</span>
+    <span class="pill ${byStatus.running.length ? "run" : ""}">${byStatus.running.length} 个任务进行中</span>
+    <span class="pill ${nLeafRun ? "run" : ""}">${nLeafRun}/${allLeaves.length} 个工人在跑</span>
+    <span class="pill">${esc(inst.home.split("/").slice(-1)[0])}</span>${inst.error ? `<span class="pill fail">${esc(inst.error)}</span>` : ""}`;
+  sec.appendChild(head);
+  const sc = document.createElement("div"); sc.className = "scroll"; sec.appendChild(sc);
+
+  const colX = [PAD]; colX.push(colX[0] + W.root + GAPX); colX.push(colX[1] + W.status + GAPX); colX.push(colX[2] + W.task + GAPX);
+  // ---- 布局 ----
+  let y = PAD; const groups = [];
+  GROUPS.forEach(gd => {
+    const list = byStatus[gd.key]; if (!list.length) return;
+    const folded = isFolded(inst, gd.key), mk = foldKey(inst, gd.key);
+    const shown = folded ? [] : (state.more.has(mk) ? list : list.slice(0, CAP));
+    const rows = []; let gy = y;
+    shown.forEach(t => {
+      const lh = t.leaves.length * (H.leaf + GAPY) - GAPY;
+      const rowH = Math.max(H.task, lh);
+      rows.push({ t, y: gy, h: rowH, ty: gy + (rowH - H.task) / 2, ly: t.leaves.map((_, i) => gy + (rowH - lh) / 2 + i * (H.leaf + GAPY)) });
+      gy += rowH + GAPY;
+    });
+    let extra = 0;
+    if (!folded && list.length > shown.length) { extra = 22; gy += extra; }
+    const gh = Math.max(rows.length ? gy - y - GAPY - extra + (extra ? 0 : 0) : 0, H.status);
+    const top = y, mid = rows.length ? (rows[0].ty + H.task / 2 + rows[rows.length - 1].ty + H.task / 2) / 2 : top + H.status / 2;
+    groups.push({ gd, list, folded, rows, mk, sy: mid - H.status / 2, moreY: gy - extra + 4, hidden: list.length - shown.length });
+    y = Math.max(gy, top + H.status + GAPY) + GROUPGAP - GAPY;
+  });
+  const totalH = Math.max(y - GROUPGAP + GAPY + PAD, H.root + PAD * 2);
+  const svgW = colX[3] + W.leaf + PAD;
+  const svg = el("svg", { width: svgW, height: totalH, viewBox: `0 0 ${svgW} ${totalH}` });
+  const linkG = el("g", {}, svg), nodeG = el("g", {}, svg);
+  const curve = (x1, y1, x2, y2, run) => { const mx = (x1 + x2) / 2; el("path", { class: "link" + (run ? " run" : ""), d: `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}` }, linkG); };
+  const rootY = groups.length ? (groups[0].sy + groups[groups.length - 1].sy + H.status) / 2 - H.root / 2 : PAD;
+
+  groups.forEach(G => {
+    curve(colX[0] + W.root, rootY + H.root / 2, colX[1], G.sy + H.status / 2, G.gd.key === "running");
+    G.rows.forEach(r => {
+      curve(colX[1] + W.status, G.sy + H.status / 2, colX[2], r.ty + H.task / 2, r.t.status === "running");
+      r.t.leaves.forEach((l, i) => curve(colX[2] + W.task, r.ty + H.task / 2, colX[3], r.ly[i] + H.leaf / 2, l.status === "running"));
+    });
+  });
+
+  // 根
+  const busy = inst.state === "busy", offline = inst.state === "offline";
+  const rootCls = offline ? "fail" : busy ? "run" : "rest";
+  const rootLine = offline ? "离线" : busy ? `忙碌 · 已忙 ${dur(now - (inst.busy_since || now))}` : (inst.rest_since ? `休息 · 已休息 ${dur(now - inst.rest_since)}` : "休息 · 暂无记录");
+  nodeBox(nodeG, { x: colX[0], y: rootY, w: W.root, h: H.root, type: "root", cls: rootCls, sel: state.sel === "root:" + inst.id,
+    lines: [fit(inst.name, 26), fit(rootLine, 28)], onClick: () => { state.sel = "root:" + inst.id; openSide({ ...inst, _kind: "root" }, "root", now); render(); } });
+
+  // 状态层 + 任务 + 叶子
+  groups.forEach(G => {
+    const nRun = G.list.reduce((a, t) => a + t.leaves.filter(l => l.status === "running").length, 0);
+    const sub = G.gd.key === "running" && nRun ? `${G.list.length} 个任务 · ${nRun} 个工人在跑` : `${G.list.length} 个任务`;
+    nodeBox(nodeG, { x: colX[1], y: G.sy, w: W.status, h: H.status, type: "status", cls: G.gd.cls, chev: G.folded ? "▸" : "▾",
+      lines: [G.gd.title, sub], onClick: () => { setFold(inst, G.gd.key, !G.folded); render(); } });
+    G.rows.forEach(r => {
+      const t = r.t, nl = t.leaves.length;
+      const l3 = ((t.note && t.status === "running" ? "📡 " + t.note + " · " : "") + `${t.chat ? fit(t.chat, 16) : ""}${nl ? ` · ${nl} 个工人` : ""}${t.status === "done" && t.endedAt ? " · 用时 " + dur(t.endedAt - t.startedAt) : ""}`).replace(/^ · /, "");
+      nodeBox(nodeG, { x: colX[2], y: r.ty, w: W.task, h: H.task, type: "task", cls: ST[t.status] ? ST[t.status][0] : "stall", sel: state.sel === t.id,
+        lines: [fit((t.reported ? "📡 " : "") + (t.title || "（空）"), 38), fit(timeLine(t, now), 46), fit(l3 || " ", 46)],
+        onClick: () => { state.sel = t.id; openSide(t, "task", now); render(); } });
+      t.leaves.forEach((l, i) => {
+        const h = l.harness || l.kind || "claude";
+        const hn = HARN[h] || h;
+        const l2 = l.status === "running" ? (l.doing && l.doing.now ? "▶ " + l.doing.now : "运行中…")
+          : l.status === "done" ? "用时 " + dur((l.endedAt || l.startedAt) - l.startedAt) + (l.mode ? " · " + l.mode : "")
+          : (l.error ? "✖ " + l.error : (l.status === "stalled" ? "无响应，疑似被中断" : ST[l.status][1]));
+        nodeBox(nodeG, { x: colX[3], y: r.ly[i], w: W.leaf, h: H.leaf, type: "leaf", icon: h,
+          cls: ST[l.status] ? ST[l.status][0] : "stall", sel: state.sel === l.id,
+          lines: [fit((l.reported ? "📡 " : "") + l.title, 48),
+                  fit(`[${hn}]${l.model ? " · " + l.model : ""} · ${l.expect ? "期待：" + l.expect : l2}`, 48),
+                  fit(timeLine(l, now), 48)],
+          onClick: () => { state.sel = l.id; openSide(l, "leaf", now); render(); } });
+      });
+    });
+    if (!G.folded && G.hidden > 0) {
+      const m = el("text", { class: "more", x: colX[2], y: G.moreY + 14 }, nodeG); m.textContent = `▾ 还有 ${G.hidden} 个更早的「${G.gd.title}」任务，点击展开`;
+      m.addEventListener("click", () => { state.more.add(G.mk); render(); });
+    }
+  });
+  sc.appendChild(svg);
+  if (!groups.length) { const n = document.createElement("div"); n.className = "empty"; n.style.padding = "0 16px 14px"; n.textContent = state.onlyRun ? "当前没有进行中的任务。" : "这段时间内没有任务，只有一个空的根节点。"; sc.appendChild(n); }
+  return sec;
+}
+
+function render() {
+  const snap = state.snap; if (!snap) return;
+  const now = nowTs();
+  const main = $("#main");
+  const wx = window.scrollX, wy = window.scrollY;
+  const keep = [...main.querySelectorAll(".scroll")].map(s => [s.scrollLeft, s.scrollTop]);
+  const frag = document.createDocumentFragment();
+  if (!snap.instances.length) { const d = document.createElement("div"); d.className = "empty"; d.textContent = "没发现 Hermes 实例。"; frag.appendChild(d); }
+  snap.instances.forEach(inst => frag.appendChild(renderInstance(inst, now)));
+  main.style.minHeight = main.offsetHeight + "px";
+  main.replaceChildren(frag);
+  main.querySelectorAll(".scroll").forEach((sc, i) => { if (keep[i]) { sc.scrollLeft = keep[i][0]; sc.scrollTop = keep[i][1]; } });
+  window.scrollTo(wx, wy);
+  main.style.minHeight = "";
+  window.scrollTo(wx, wy);
+  renderChips();
+}
+
+// 顶部：每个 Hermes 忙/闲 + 持续时间（每秒走字）
+function renderChips() {
+  const snap = state.snap; if (!snap) return;
+  const now = nowTs(), box = $("#chips");
+  const html = snap.instances.map(i => {
+    const busy = i.state === "busy", off = i.state === "offline";
+    const cls = off ? "offline" : busy ? "busy" : "rest";
+    const txt = off ? "离线" : busy ? `忙碌 · 已忙 ${dur(now - (i.busy_since || now))}` : (i.rest_since ? `休息 · 已休息 ${dur(now - i.rest_since)}` : "休息");
+    const dot = off ? "fail" : busy ? "run" : "rest";
+    return `<span class="chip ${cls}" data-id="${esc(i.id)}"><i class="dot ${dot}" style="margin:0"></i><b>${esc(i.name)}</b><small>${esc(txt)}</small></span>`;
+  }).join("");
+  if (box.dataset.h !== html) { box.innerHTML = html; box.dataset.h = html; }
+}
+$("#chips").addEventListener("click", e => { const c = e.target.closest(".chip"); if (!c) return; const s = document.getElementById("inst-" + c.dataset.id); if (s) s.scrollIntoView({ behavior: "smooth", block: "start" }); });
+setInterval(renderChips, 1000);
+
+function renderInsp(ins) {
+  if (!ins) return;
+  const box = $("#insp"), pre = $("#inspText"), meta = $("#inspMeta");
+  if (ins.text && pre.dataset.t !== String(ins.ts)) { pre.textContent = ins.text; pre.dataset.t = ins.ts; }
+  const when = ins.ts ? new Date(ins.ts * 1000).toLocaleTimeString("zh-CN", { hour12: false }) : "";
+  meta.textContent = ins.error ? "巡检失败：" + ins.error : (when ? `更新于 ${when} · ${ins.model || ""}` : "等待首次巡检…");
+  box.classList.toggle("err", !!ins.error);
+}
+$("#inspBar").onclick = () => {
+  const open = $("#insp").classList.toggle("open");
+  try { localStorage.setItem("hm.insp", open ? "1" : "0"); } catch (_) {}
+  $("#inspBar").lastElementChild.textContent = open ? "▾" : "▸";
+};
+try { if (localStorage.getItem("hm.insp") !== "0") $("#insp").classList.add("open"); } catch (_) {}
+
+function openSide(n, kind, now) {
+  const stk = kind === "root" ? (n.state === "busy" ? "running" : n.state === "offline" ? "failed" : "rest") : n.status;
+  const [cls, label] = kind === "root" ? [n.state === "busy" ? "run" : n.state === "offline" ? "fail" : "rest", n.state === "busy" ? "忙碌" : n.state === "offline" ? "离线" : "休息"] : (ST[stk] || ST.stalled);
+  const hname = kind === "leaf" ? (HARN[n.harness || n.kind] || n.harness || n.kind || "工人") : "";
+  $("#sideTitle").innerHTML = `<i class="dot ${cls}"></i>${kind === "leaf" ? "工人 · " + esc(hname) : kind === "task" ? "任务" : "Hermes"} · ${label}`;
+  let h = "";
+  if (kind === "task") {
+    h += `<div class="kv"><span>会话</span><span>${esc(n.chat)} (${esc(n.chatType || n.source)})</span><span>启动</span><span>${full(n.startedAt)}</span><span>${n.status === "running" ? "已运行" : "结束"}</span><span>${n.status === "running" ? dur(now - n.startedAt) : full(n.endedAt || n.lastTs)}</span><span>工具调用</span><span>${n.toolCalls} 次</span><span>工人</span><span>${n.leaves.length} 个</span>${n.titleSource === "llm" ? "<span>标题</span><span>AI 摘要</span>" : ""}${n.note ? `<span>进展</span><span>${esc(n.note)}</span>` : ""}${n.reported ? "<span>来源</span><span>Hermes 主动上报</span>" : ""}${n.followups ? `<span>追加指令</span><span>${n.followups} 条</span>` : ""}</div>
+      <h3>用户请求原文</h3><pre>${esc(n.text || n.rawTitle || n.title)}</pre>${n.final ? `<h3>Hermes 最终回复</h3><pre>${esc(n.final)}</pre>` : ""}`;
+  } else if (kind === "leaf") {
+    h += `<div class="kv"><span>工人</span><span>${esc(HARN[n.harness || n.kind] || n.harness || n.kind || "Claude")}${n.model ? " · " + esc(n.model) : ""}</span><span>模式</span><span>${esc(n.mode)}</span><span>目录</span><span>${esc(n.cwd || "—")}</span><span>启动</span><span>${full(n.startedAt)}</span><span>${n.status === "running" ? "已运行" : "结束"}</span><span>${n.status === "running" ? dur(now - n.startedAt) : full(n.endedAt)}</span>${n.pid ? `<span>PID</span><span>${n.pid}（进程存活）</span>` : ""}${n.lastActivity ? `<span>最近动静</span><span>${dur(now - n.lastActivity)}前</span>` : ""}${n.tokens ? `<span>tokens</span><span>${n.tokens}</span>` : ""}</div>`;
+    h += n.aiNote
+      ? `<h3>AI 概览</h3><div class="kv"><span>任务</span><span>${esc(n.title)}</span><span>期望产出</span><span>${esc(n.expect || "—")}</span></div>`
+      : `<h3>AI 概览</h3><p style="color:var(--muted)">后台 Agent 正在总结这个工人任务…</p>`;
+    if (n.doing) h += `<h3>${n.status === "running" ? "此刻在做" : "最后做的事"}</h3><ul class="steps">${n.doing.recent.map(s => `<li>${esc(s)}</li>`).join("")}</ul>`;
+    if (n.result) h += `<h3>返回结果</h3><pre>${esc(n.result)}</pre>`;
+    if (n.error) h += `<h3>错误</h3><pre>${esc(n.error)}</pre>`;
+  } else {
+    h += `<div class="kv"><span>应用名</span><span>${esc(n.name)}</span><span>目录</span><span>${esc(n.home)}</span><span>gateway</span><span>${n.alive ? "在线 (PID " + n.pid + ")" : "离线"}</span><span>${n.state === "busy" ? "已忙" : "已休息"}</span><span>${n.state === "busy" ? dur(now - n.busy_since) : n.rest_since ? dur(now - n.rest_since) + "（最近活动 " + full(n.rest_since) + "）" : "—"}</span></div>
+      <p style="color:var(--muted)">根节点 = 一个 Hermes（飞书应用）。下一层是任务状态（正在运行中 / 被中断 / 已完成，可点击折叠），再往下是对话任务，叶子是被派出去的工人（Claude Code / opencode / Antigravity）。</p>`;
+  }
+  const sb = $("#sideBody"), st = sb.scrollTop;
+  sb.innerHTML = h; $("#side").classList.add("open"); sb.scrollTop = st;
+}
+$("#sideClose").onclick = () => { $("#side").classList.remove("open"); state.sel = null; render(); };
+document.addEventListener("click", e => { if (!e.target.closest("aside") && !e.target.closest(".node")) $("#side").classList.remove("open"); });
+$("#win").onchange = e => { state.win = +e.target.value; try { localStorage.setItem("hm.win", state.win); } catch (_) {} render(); };
+$("#onlyRun").onchange = e => { state.onlyRun = e.target.checked; try { localStorage.setItem("hm.run", state.onlyRun ? "1" : "0"); } catch (_) {} render(); };
+$("#expandAll").onclick = () => {
+  if (!state.snap) return;
+  const anyFolded = state.snap.instances.some(i => isFolded(i, "done"));
+  state.snap.instances.forEach(i => setFold(i, "done", !anyFolded));
+  $("#expandAll").textContent = anyFolded ? "折叠已完成" : "展开已完成"; render();
+};
+
+let fails = 0;
+async function poll() {
+  try {
+    const r = await fetch("api/snapshot", { cache: "no-store" });
+    state.snap = await r.json(); state.recvAt = Date.now(); fails = 0;
+    const age = Date.now() / 1000 - state.snap.ts;
+    $("#live").className = "live" + (age > 15 ? " bad" : ""); $("#liveTxt").textContent = age > 15 ? `数据已 ${Math.round(age)} 秒没更新` : "实时 · " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
+    if (state.sel && $("#side").classList.contains("open")) {
+      const now = nowTs();
+      for (const i of state.snap.instances) {
+        if ("root:" + i.id === state.sel) openSide({ ...i }, "root", now);
+        for (const t of i.tasks) { if (t.id === state.sel) openSide(t, "task", now); for (const l of t.leaves) if (l.id === state.sel) openSide(l, "leaf", now); }
+      }
+    }
+    renderInsp(state.snap.inspect);
+    render();
+  } catch (e) { fails++; $("#live").className = "live bad"; $("#liveTxt").textContent = "连接失败，重试中…"; }
+  setTimeout(poll, fails > 3 ? 6000 : 3000);
+}
+poll();
+</script>
+</body>
+</html>
