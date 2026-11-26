@@ -1634,6 +1634,7 @@ TITLE_S = float(os.environ.get("TITLE_S", "60"))
 # 标题/工人摘要的 LLM 也只在「出现新节点」时调用：记住见过的节点指纹，
 # 没有新节点就完全不打模型；有但距上次不足 TITLE_MIN_INTERVAL_S 时也只等不调。
 TITLE_MIN_INTERVAL_S = float(os.environ.get("TITLE_MIN_INTERVAL_S", "120"))
+OUTCOME_FILE = os.path.join(DATA_DIR, "outcomes.json")
 SEEN_NODES_FILE = os.path.join(DATA_DIR, "seen_nodes.json")
 _seen_nodes = set()
 _seen_lock = threading.Lock()
@@ -1642,6 +1643,8 @@ _titles = {}
 _titles_lock = threading.Lock()
 _leaf_notes = {}
 _leaf_lock = threading.Lock()
+_outcomes = {"leaves": {}, "tasks": {}}       # 完成结果：由 summary.md + 产出目录总结出来
+_outcome_lock = threading.Lock()
 
 
 def llm_chat(prompt, max_tokens=1200, temperature=0.3, timeout=90, model=None):
@@ -1695,6 +1698,140 @@ def save_titles():
         os.replace(tmp, TITLES_FILE)
     except Exception as e:
         print("titles save error:", e, file=sys.stderr, flush=True)
+
+
+def load_outcomes():
+    try:
+        with open(OUTCOME_FILE) as f:
+            o = json.load(f)
+        if isinstance(o, dict):
+            with _outcome_lock:
+                _outcomes["leaves"] = o.get("leaves") or {}
+                _outcomes["tasks"] = o.get("tasks") or {}
+    except Exception:
+        pass
+
+
+def save_outcomes():
+    tmp = OUTCOME_FILE + ".tmp"
+    try:
+        with _outcome_lock:
+            data = {"leaves": dict(_outcomes["leaves"]), "tasks": dict(_outcomes["tasks"])}
+        with open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=0)
+        os.replace(tmp, OUTCOME_FILE)
+    except Exception as e:
+        print("save outcomes error:", e, file=sys.stderr, flush=True)
+
+
+def find_summary_files(cwd, prompt, limit=3):
+    """在产出目录里找 summary.md：prompt 里提到的路径 + task/*/harness_dispatch/*/summary.md。"""
+    import glob as _g
+    found = []
+    for m in re.finditer(r"([\w./~-]*summary\.md)", prompt or ""):
+        p = m.group(1)
+        if not os.path.isabs(p) and cwd:
+            p = os.path.join(cwd, p)
+        if os.path.isfile(p):
+            found.append(p)
+    for pat in ("task/*/harness_dispatch/*/summary.md", "task/*/summary.md", "task/summary.md"):
+        if not cwd:
+            break
+        cands = sorted(_g.glob(os.path.join(cwd, pat)), key=lambda x: -os.path.getmtime(x))[:2]
+        found.extend(cands)
+    out, seen = [], set()
+    for p in found:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def summarize_outcomes():
+    """给“已结束的工人”和“已结束的任务”各生成一句完成结果（有 summary.md 就基于它）。"""
+    with _lock:
+        snap = _snapshot
+    with _outcome_lock:
+        cache = {"leaves": dict(_outcomes["leaves"]), "tasks": dict(_outcomes["tasks"])}
+    todo = []
+    for i in snap.get("instances", []):
+        for t in i.get("tasks", []):
+            for l in (t.get("leaves") or []):
+                if l.get("status") == "running" or l.get("harness") == "service":
+                    continue
+                raw = (l.get("prompt") or "").strip()
+                if not raw:
+                    continue
+                sig = _title_hash(raw + "|" + (l.get("result") or "")[:400])
+                if cache["leaves"].get(l.get("id"), {}).get("h") != sig:
+                    todo.append(("leaf", l.get("id"), sig, l))
+            continue
+
+        for t in i.get("tasks", []):
+            live = [l for l in (t.get("leaves") or []) if l.get("status") in ("running",)]
+            if t.get("status") == "running" or live:
+                continue
+            if not t.get("leaves"):
+                continue
+            key = t.get("id")
+            sig = _title_hash((t.get("rawTitle") or "") + "|" + ",".join(
+                (l.get("id") or "") for l in t.get("leaves") or []))
+            if cache["tasks"].get(key, {}).get("h") != sig:
+                todo.append(("task", key, sig, t))
+    n = 0
+    for kind, key, sig, obj in todo[:6]:
+        try:
+            if kind == "leaf":
+                ev = ["初始派活 prompt：\n" + (obj.get("prompt") or "")[:3000]]
+                if obj.get("result"):
+                    ev.append("harness 回执（截断）：\n" + str(obj.get("result"))[:1200])
+                cmd = obj.get("command") or ""
+                for m in re.finditer(r"(?:>|tee\s+|-log\s+)([\w./~-]+\.log)", cmd):
+                    lp = m.group(1)
+                    if not os.path.isabs(lp) and obj.get("cwd"):
+                        lp = os.path.join(obj["cwd"], lp)
+                    txt = _read(lp)
+                    if txt:
+                        ev.append("执行日志尾部（%s）：\n%s" % (os.path.basename(lp), txt[-2000:]))
+                        break
+                mds = find_summary_files(obj.get("cwd") or "", obj.get("prompt") or "")
+                for p in mds:
+                    t = _read(p) or ""
+                    if t:
+                        ev.append("summary.md（%s）：\n%s" % (os.path.basename(os.path.dirname(p)) or p, t[:2500]))
+                prompt = ("下面是某个 AI 工人被派活时的任务书、它的回执，以及产出目录里的 summary.md。\n"
+                          "请用不超过 120 字总结：这个工人最终完成了什么、产出文件在哪、关键数据或结论。\n"
+                          "没完成就直说卡在哪。只输出结论本身。\n\n" + "\n\n".join(ev))
+                text = llm_chat(prompt, max_tokens=600, temperature=0.2, timeout=120,
+                                model=LLM_FALLBACK_MODEL or None)
+                with _outcome_lock:
+                    _outcomes["leaves"][key] = {"h": sig, "text": text.strip()[:600],
+                                                "src": [os.path.basename(p) for p in mds], "ts": int(time.time())}
+                n += 1
+                continue
+            if kind == "task":
+                ev = []
+                ev.append("任务：" + (obj.get("rawTitle") or obj.get("title") or "")[:300])
+                ev.append("用户请求：" + (obj.get("text") or "")[:1200])
+                for l in (obj.get("leaves") or [])[:6]:
+                    ev.append("工人[%s] %s | 结果：%s" % (
+                        l.get("harness"), (l.get("plan") or {}).get("title") or l.get("title"),
+                        (l.get("outcome") or l.get("result") or "")[:400]))
+                prompt = ("根据下面的任务与执行记录，用不超过 150 字总结这次任务最终完成了什么、产出在哪、关键数据/结论。\n"
+                          "只输出结论本身，不要序号、不要解释。\n\n" + "\n".join(ev))
+                text = llm_chat(prompt, max_tokens=500, temperature=0.2, timeout=90,
+                                model=LLM_FALLBACK_MODEL or None)
+                with _outcome_lock:
+                    _outcomes["tasks"][key] = {"h": sig, "text": text.strip()[:600], "ts": int(time.time())}
+                n += 1
+        except Exception as e:
+            print("outcome llm error:", e, file=sys.stderr, flush=True)
+    if n:
+        save_outcomes()
+    return n
 
 
 def load_leaf_notes():
@@ -1965,6 +2102,30 @@ def summarize_titles():
     return n
 
 
+def pending_outcomes(snap):
+    """已结束但还没生成“完成结果”的工人 / 任务数量。"""
+    with _outcome_lock:
+        ol = dict(_outcomes["leaves"])
+        ot = dict(_outcomes["tasks"])
+    n = 0
+    for i in (snap or {}).get("instances", []):
+        for t in i.get("tasks", []):
+            live = [l for l in (t.get("leaves") or []) if l.get("status") == "running"]
+            for l in (t.get("leaves") or []):
+                if l.get("status") == "running" or l.get("harness") == "service":
+                    continue
+                if not (l.get("prompt") or "").strip():
+                    continue
+                sig = _title_hash((l.get("prompt") or "") + "|" + (l.get("result") or "")[:400])
+                if ol.get(l.get("id"), {}).get("h") != sig:
+                    n += 1
+            if t.get("status") != "running" and not live and t.get("leaves"):
+                sig = _title_hash((t.get("rawTitle") or "") + "|" + ",".join(l.get("id") or "" for l in t.get("leaves") or []))
+                if ot.get(t.get("id"), {}).get("h") != sig:
+                    n += 1
+    return n
+
+
 def pending_leaf_notes(snap):
     """还有哪些工人的「结构化解析」没做过（缓存缺失或原文变了）。"""
     with _leaf_lock:
@@ -1990,6 +2151,7 @@ def title_loop():
       2) 距上次标题调用 ≥ TITLE_MIN_INTERVAL_S（默认 120s），防止一波新节点连发。
     """
     load_seen_nodes()
+    load_outcomes()
     time.sleep(8)
     last_call = float(_LLM_STATS.get("title_call_ts") or 0.0)
     while True:
@@ -2001,11 +2163,12 @@ def title_loop():
             with _seen_lock:
                 new_keys = keys - _seen_nodes
             now = time.time()
-            pending = pending_leaf_notes(snap)
+            pending = pending_leaf_notes(snap) + pending_outcomes(snap)
+            min_gap = 45.0 if pending >= 6 else TITLE_MIN_INTERVAL_S
             if not new_keys and pending == 0:
                 _LLM_STATS["title_skipped"] += 1
                 _LLM_STATS["title_reason"] = "no-new-node"
-            elif now - last_call < TITLE_MIN_INTERVAL_S:
+            elif now - last_call < min_gap:
                 _LLM_STATS["title_skipped"] += 1
                 _LLM_STATS["title_reason"] = "new-node-cooling"
             else:
@@ -2018,6 +2181,10 @@ def title_loop():
                     n += summarize_leaf_notes()
                 except Exception as e:
                     print("leaf loop error:", e, file=sys.stderr, flush=True)
+                try:
+                    n += summarize_outcomes()
+                except Exception as e:
+                    print("outcome loop error:", e, file=sys.stderr, flush=True)
                 last_call = _LLM_STATS["title_call_ts"] = time.time()
                 _LLM_STATS["title_calls"] += 1
                 _LLM_STATS["title_reason"] = ("new-node(%d)" % len(new_keys)) if new_keys else ("pending(%d)" % pending)
@@ -2075,6 +2242,41 @@ def save_seen_nodes():
         os.replace(tmp, SEEN_NODES_FILE)
     except Exception:
         pass
+
+
+def decorate_leaves(insts):
+    """给叶子补 brief（一句话简介）、turns（与同一 harness 的轮次）、outcome（完成结果）。"""
+    with _outcome_lock:
+        oc_l = dict(_outcomes["leaves"])
+        oc_t = dict(_outcomes["tasks"])
+    for i in insts:
+        for t in i.get("tasks", []):
+            plans = {}
+            for leaf in t.get("leaves", []):
+                p = leaf.get("plan") or {}
+                what = (p.get("what") or "").strip()
+                res = (p.get("result") or "").strip()
+                if what or res:
+                    leaf["brief"] = clip((what + (("　→　" + res) if res else "")).strip(), 90)
+                if leaf.get("expect") and not leaf.get("brief"):
+                    leaf["brief"] = clip("期待：" + str(leaf["expect"]), 90)
+            # 同一 harness 在本任务里被派了几次 = 轮次
+            h = {}
+            for leaf in t.get("leaves", []):
+                k = leaf.get("harness") or "claude"
+                h[k] = h.get(k, 0) + 1
+            for leaf in t.get("leaves", []):
+                leaf["turns"] = h.get(leaf.get("harness") or "claude", 1)
+                if not leaf.get("model"):
+                    m = re.search(r"(?:-m|--model)[ =]([\w./:-]+)", leaf.get("command") or "")
+                    leaf["model"] = m.group(1) if m else "默认"
+                o = oc_l.get(leaf.get("id"))
+                if o and o.get("text"):
+                    leaf["outcome"] = o["text"]
+            o = oc_t.get(t.get("id"))
+            if o and o.get("text"):
+                t["outcome"] = o["text"]
+    return insts
 
 
 def tree_signature(snap):
@@ -2241,6 +2443,7 @@ def build():
                         leaf["expect"] = c["e"]
                         leaf["aiNote"] = True
                         leaf["plan"] = c.get("p")
+        decorate_leaves(insts)
         with _inspect_lock:
             ins = dict(_inspect)
         return {"ts": now, "window_hours": WINDOW_H, "instances": insts, "inspect": ins,
@@ -2370,6 +2573,7 @@ def build():
                     else:
                         nw = (leaf.get("doing") or {}).get("now")
                         leaf["title"] = nw or ("%s 工人" % (leaf.get("harness") or leaf.get("kind") or "Claude"))
+    decorate_leaves(insts)
     with _inspect_lock:
         ins = dict(_inspect)
     return {"ts": now, "window_hours": WINDOW_H, "instances": insts, "inspect": ins,
