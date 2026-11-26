@@ -126,6 +126,7 @@ def proc_table():
             rest = stat[stat.rindex(")") + 2:].split()
             ppid = int(rest[1])
             start = boot_time() + int(rest[19]) / _CLK
+            cpu_s = (int(rest[11]) + int(rest[12])) / _CLK
         except Exception:
             continue
         raw = _read(f"/proc/{pid}/cmdline", "rb")
@@ -134,8 +135,46 @@ def proc_table():
             cwd = os.readlink(f"/proc/{pid}/cwd")
         except Exception:
             cwd = ""
-        out[pid] = {"pid": pid, "ppid": ppid, "cmd": cmd, "cwd": cwd, "start": start}
+        out[pid] = {"pid": pid, "ppid": ppid, "cmd": cmd, "cwd": cwd, "start": start, "cpu_s": cpu_s}
     return out
+
+
+_HAPPY_PROFILE_RE = re.compile(r"-p\s+(hermes\d*)\b")
+
+
+def is_service_proc(p):
+    """基础设施进程：模型网关 shim、happy 桥、opencode serve/acp —— 不算工人。"""
+    cmd = " ".join(p.get("cmd") or [])
+    if "shim.js" in cmd:
+        return True
+    if "/happy" in cmd and " acp" in cmd:
+        return True
+    if re.search(r"\bopencode\s+(acp|serve)\b", cmd) or re.search(r"\bopencode\.exe\s+serve\b", cmd):
+        return True
+    return False
+
+
+def service_owner(p, inst_ids):
+    """happy acp -- hermes -p hermesN 这类桥，按 -p 参数或 cwd 归到对应实例。"""
+    cmd = " ".join(p.get("cmd") or [])
+    m = _HAPPY_PROFILE_RE.search(cmd)
+    if m:
+        name = (m.group(1) or "hermes")
+        return name if name in inst_ids else ("hermes-default" if name == "hermes" else None)
+    mm = re.search(r"/bot/(hermes\d*)/?$", p.get("cwd") or "")
+    if mm:
+        name = mm.group(1) or "hermes"
+        return name if name in inst_ids else ("hermes-default" if name == "hermes" else None)
+    return None
+
+
+def is_idle_worker(p, now, min_age_s=7200, cpu_ratio=0.01):
+    """老进程 + CPU 时间占比 <1% → 休眠（挂着的 TUI 空转）。"""
+    age = now - (p.get("start") or now)
+    if age < min_age_s:
+        return False
+    cpu = p.get("cpu_s") or 0.0
+    return (cpu / max(age, 1.0)) < cpu_ratio
 
 
 _SESSION_META = {}
@@ -1144,7 +1183,8 @@ def collect_instance(inst, procs, now, used_procs=None):
                 "title": clip(redact(inv.get("title") or inv.get("prompt") or " ".join(p["cmd"][1:]) or h), 80),
                 "prompt": redact(inv.get("prompt") or "")[:3000],
                 "command": redact(" ".join(p["cmd"]))[:800], "cwd": p["cwd"],
-                "startedAt": p["start"], "endedAt": None, "status": "running", "pid": p["pid"],
+                "startedAt": p["start"], "endedAt": None,
+                "status": "stalled" if is_idle_worker(p, now) else "running", "pid": p["pid"],
                 "doing": None, "lastActivity": None,
                 "model": inv.get("model", ""), "session": inv.get("session", ""),
                 "conversation": inv.get("conversation", ""), "titleHint": inv.get("title", ""),
@@ -2031,9 +2071,58 @@ def build():
         except Exception as e:  # 单个实例出错不影响其它
             insts.append({"id": inst["id"], "name": inst.get("label") or inst["id"], "home": inst["home"],
                           "alive": False, "tasks": [], "error": f"{type(e).__name__}: {e}"})
+    inst_ids = {i["id"] for i in insts}
+
+    def _service_leaf(p):
+        cmd = " ".join(p.get("cmd") or [])
+        return {
+            "id": f"proc:{p['pid']}", "kind": "service", "harness": "service", "mode": "service",
+            "title": clip(redact(cmd), 80), "prompt": "", "command": redact(cmd)[:800],
+            "cwd": p.get("cwd") or "", "startedAt": p.get("start"), "endedAt": None,
+            "status": "running", "pid": p["pid"], "doing": None, "lastActivity": None,
+            "model": "", "session": "", "conversation": "", "titleHint": "",
+        }
+
+    # 基础设施进程（happy 桥 / 模型网关 / opencode serve、acp）：能按 -p / cwd 归到实例的就归过去
+    svc_free = []
+    for p in procs.values():
+        if p["pid"] in used or not is_service_proc(p):
+            continue
+        used.add(p["pid"])
+        owner = service_owner(p, inst_ids)
+        if owner:
+            for i in insts:
+                if i["id"] == owner:
+                    for t in i.get("tasks", []):
+                        if t.get("id") == f"{owner}:service":
+                            t["leaves"].append(_service_leaf(p))
+                            break
+                    else:
+                        i.setdefault("tasks", []).append({
+                            "id": f"{owner}:service", "title": "服务进程（happy 桥 / 模型网关）", "text": "",
+                            "session": "", "chat": "", "chatType": "", "source": "process", "status": "running",
+                            "startedAt": p.get("start"), "endedAt": None, "lastTs": now, "toolCalls": 0,
+                            "final": None, "leaves": [_service_leaf(p)]})
+                    i["active_agents"] = (i.get("active_agents") or 0) + 1
+                    break
+        else:
+            svc_free.append(p)
+    if svc_free:
+        leaves = [_service_leaf(p) for p in svc_free]
+        insts.append({
+            "id": "services", "name": "基础设施进程", "home": "", "alive": True, "pid": None,
+            "gateway_state": "running", "active_agents": len(leaves), "error": None, "state": "rest",
+            "busy_since": None, "rest_since": min(l["startedAt"] for l in leaves),
+            "tasks": [{"id": "services:all", "title": "服务进程（不属于任何任务：模型网关 / happy 桥 / serve）",
+                       "text": "", "session": "", "chat": "", "chatType": "", "source": "process",
+                       "status": "done", "startedAt": min(l["startedAt"] for l in leaves), "endedAt": None,
+                       "lastTs": now, "toolCalls": 0, "final": None, "leaves": leaves}],
+        })
+
     # 任何实例都没认领的存活工人进程（手工在 shell / tmux 里起的 opencode、claude…）
     leftovers = [p for p in procs.values()
-                 if is_harness_proc(p) and p["pid"] not in used and is_harness_payload(p, procs)]
+                 if is_harness_proc(p) and p["pid"] not in used and not is_service_proc(p)
+                 and is_harness_payload(p, procs)]
     human = [p for p in leftovers if is_human_session(p)]
     leftovers = [p for p in leftovers if p not in human]
 
@@ -2047,7 +2136,8 @@ def build():
                 "title": clip(redact(inv.get("title") or inv.get("prompt") or " ".join(p["cmd"][1:]) or h), 80),
                 "prompt": redact(inv.get("prompt") or "")[:3000],
                 "command": redact(" ".join(p["cmd"]))[:800], "cwd": p["cwd"],
-                "startedAt": p["start"], "endedAt": None, "status": "running", "pid": p["pid"],
+                "startedAt": p["start"], "endedAt": None,
+                "status": "stalled" if is_idle_worker(p, now) else "running", "pid": p["pid"],
                 "doing": None, "lastActivity": None, "model": inv.get("model", ""),
                 "session": inv.get("session", ""), "conversation": "", "titleHint": inv.get("title", ""),
             })
@@ -2093,8 +2183,11 @@ def build():
                     leaf["expect"] = c["e"]
                     leaf["aiNote"] = True
                 elif not leaf.get("reported"):
-                    nw = (leaf.get("doing") or {}).get("now")
-                    leaf["title"] = nw or ("%s 工人" % (leaf.get("harness") or leaf.get("kind") or "Claude"))
+                    if leaf.get("harness") == "service":
+                        leaf.setdefault("title", "服务进程")
+                    else:
+                        nw = (leaf.get("doing") or {}).get("now")
+                        leaf["title"] = nw or ("%s 工人" % (leaf.get("harness") or leaf.get("kind") or "Claude"))
     with _inspect_lock:
         ins = dict(_inspect)
     return {"ts": now, "window_hours": WINDOW_H, "instances": insts, "inspect": ins,
