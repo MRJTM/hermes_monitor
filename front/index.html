@@ -123,6 +123,8 @@
   aside .kv span:nth-child(odd) { color: var(--muted); }
   ul.steps { margin: 0; padding-left: 18px; font: 12px/1.6 ui-monospace, Menlo, monospace; }
   @media (max-width: 640px) { header { padding: 8px 12px; } main { padding: 10px; } .controls { margin-left: 0; } }
+  pre.longtext { white-space: pre-wrap; word-break: break-word; max-height: 55vh; overflow: auto;
+    background: var(--soft); padding: 10px; border-radius: 8px; font-size: 12px; line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -418,6 +420,8 @@ function openSide(n, kind, now) {
     h += n.aiNote
       ? `<h3>AI 概览</h3><div class="kv"><span>任务</span><span>${esc(n.title)}</span><span>期望产出</span><span>${esc(n.expect || "—")}</span></div>`
       : `<h3>AI 概览</h3><p style="color:var(--muted)">后台 Agent 正在总结这个工人任务…</p>`;
+    if (n.prompt) h += `<h3>派活指令（原文，完整）</h3><pre class="longtext">${esc(n.prompt)}</pre>`;
+    if (n.command && n.command !== n.prompt) h += `<h3>执行命令</h3><pre class="longtext">${esc(n.command)}</pre>`;
     if (n.doing) h += `<h3>${n.status === "running" ? "此刻在做" : "最后做的事"}</h3><ul class="steps">${n.doing.recent.map(s => `<li>${esc(s)}</li>`).join("")}</ul>`;
     if (n.result) h += `<h3>返回结果</h3><pre>${esc(n.result)}</pre>`;
     if (n.error) h += `<h3>错误</h3><pre>${esc(n.error)}</pre>`;

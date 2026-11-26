@@ -937,7 +937,7 @@ def enrich_leaf(leaf, all_procs, used_procs, now):
         info = opencode_info(leaf.get("session") or "", cwd, leaf["startedAt"], leaf.get("titleHint") or "")
         if info:
             if info.get("prompt") and (not leaf.get("prompt") or leaf["prompt"].lstrip().startswith("$(")):
-                leaf["prompt"] = redact(info["prompt"])[:3000]
+                leaf["prompt"] = redact(info["prompt"])[:PROMPT_MAX]
             if leaf.get("titleHint"):
                 leaf["title"] = clip(redact(leaf["titleHint"]), 80)
             elif not leaf.get("prompt") and info.get("title") and \
@@ -955,7 +955,7 @@ def enrich_leaf(leaf, all_procs, used_procs, now):
         info = agy_info(cwd, leaf["startedAt"], leaf.get("conversation") or "")
         if info:
             if info.get("prompt") and not leaf.get("prompt"):
-                leaf["prompt"] = redact(info["prompt"])[:3000]
+                leaf["prompt"] = redact(info["prompt"])[:PROMPT_MAX]
             if info.get("title") and not leaf.get("prompt"):
                 leaf["title"] = clip(redact(info["title"]), 80)
             if info.get("doing"):
@@ -975,11 +975,11 @@ def enrich_leaf(leaf, all_procs, used_procs, now):
                 ft = first_user_text(tr[1])
                 if ft:
                     leaf["title"] = clip(redact(ft), 80)
-                    leaf["prompt"] = redact(ft)[:3000]
+                    leaf["prompt"] = redact(ft)[:PROMPT_MAX]
             if leaf["status"] == "running" and now - tr[0] > 20 * 60 and not leaf["pid"]:
                 leaf["status"] = "stalled"
     if leaf.get("prompt") and re.match(r"^\s*\$\(\s*(cat|<)", leaf["prompt"]):
-        leaf["prompt"] = redact(resolve_prompt(leaf["prompt"], cwd, leaf.get("command", "")))[:3000]
+        leaf["prompt"] = redact(resolve_prompt(leaf["prompt"], cwd, leaf.get("command", "")))[:PROMPT_MAX]
     return leaf
 
 
@@ -1101,8 +1101,8 @@ def collect_instance(inst, procs, now, used_procs=None):
                         "id": f"{sid}:{m['id']}:{call.get('id', '')[-6:]}",
                         "kind": h, "harness": h, "mode": inv["mode"],
                         "title": clip(redact(inv.get("title") or inv["prompt"] or cmd), 80),
-                        "prompt": redact(inv["prompt"])[:3000],
-                        "command": redact(cmd)[:800],
+                        "prompt": redact(inv["prompt"])[:PROMPT_MAX],
+                        "command": redact(cmd)[:CMD_MAX],
                         "cwd": cwd, "startedAt": m["timestamp"],
                         "endedAt": res["timestamp"] if res else None,
                         "status": "running", "doing": None, "pid": None,
@@ -1181,8 +1181,8 @@ def collect_instance(inst, procs, now, used_procs=None):
             leaf = {
                 "id": f"proc:{p['pid']}", "kind": h, "harness": h, "mode": inv["mode"],
                 "title": clip(redact(inv.get("title") or inv.get("prompt") or " ".join(p["cmd"][1:]) or h), 80),
-                "prompt": redact(inv.get("prompt") or "")[:3000],
-                "command": redact(" ".join(p["cmd"]))[:800], "cwd": p["cwd"],
+                "prompt": redact(inv.get("prompt") or "")[:PROMPT_MAX],
+                "command": redact(" ".join(p["cmd"]))[:CMD_MAX], "cwd": p["cwd"],
                 "startedAt": p["start"], "endedAt": None,
                 "status": "stalled" if is_idle_worker(p, now) else "running", "pid": p["pid"],
                 "doing": None, "lastActivity": None,
@@ -1346,7 +1346,7 @@ def apply_op(op, a):
                 hid = resolve_hermes(a.get("hermes"))
             lid = a.get("leaf_id") or "rl_" + uuid.uuid4().hex[:8]
             old = L.get(lid, {})
-            L[lid] = {"id": lid, "task_id": tid, "hermes": hid, "title": clip(redact(a["title"]), 200), "prompt": redact(a.get("prompt") or "")[:3000],
+            L[lid] = {"id": lid, "task_id": tid, "hermes": hid, "title": clip(redact(a["title"]), 200), "prompt": redact(a.get("prompt") or "")[:PROMPT_MAX],
                       "cwd": a.get("cwd") or "", "status": "running", "startedAt": old.get("startedAt") or now, "endedAt": None,
                       "updatedAt": now, "doing": None, "result": "", "error": "",
                       "harness": a.get("harness") or "claude", "model": a.get("model") or "",
@@ -1561,6 +1561,11 @@ INSPECT_DEBOUNCE_S = float(os.environ.get("INSPECT_DEBOUNCE_S", "15"))  # 变化
 INSPECT_MIN_INTERVAL_S = float(os.environ.get("INSPECT_MIN_INTERVAL_S", "300"))  # 两次 LLM 调用最小间隔
 INSPECT_IDLE_REFRESH_S = float(os.environ.get("INSPECT_IDLE_REFRESH_S", "0"))    # >0 时按此周期做空闲兜底刷新
 INSPECT_S = float(os.environ.get("INSPECT_S", "600"))
+# 详情页展示完整派活指令 / 命令（用户要求看全部，不截断）
+PROMPT_MAX = int(os.environ.get("PROMPT_MAX", "20000"))
+CMD_MAX = int(os.environ.get("CMD_MAX", "4000"))
+# 是否在树里显示“常驻服务/基础设施/人工终端会话”这些非任务节点（默认 0 = 不显示）
+SHOW_INFRA = os.environ.get("SHOW_INFRA", "0") not in ("0", "", "false", "False")
 INSPECT_FILE = os.path.join(DATA_DIR, "inspect.json")
 INSPECT_SIG_FILE = os.path.join(DATA_DIR, "inspect_sig.json")
 LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:4000/v1/chat/completions")
@@ -2074,12 +2079,42 @@ def build():
             insts.append({"id": inst["id"], "name": inst.get("label") or inst["id"], "home": inst["home"],
                           "alive": False, "tasks": [], "error": f"{type(e).__name__}: {e}"})
     inst_ids = {i["id"] for i in insts}
+    if not SHOW_INFRA:
+        # 用户只关心派给 Hermes 的任务：基础设施/人工会话不展示
+        with _titles_lock:
+            tc = dict(_titles)
+        for i in insts:
+            for t in i.get("tasks", []):
+                raw = t.get("title") or ""
+                t["rawTitle"] = raw
+                if t.get("noTitle"):
+                    continue
+                c = tc.get(t["id"])
+                if c and c.get("h") == _title_hash(raw) and c.get("t"):
+                    t["title"] = c["t"]
+                    t["titleSource"] = "llm"
+        with _leaf_lock:
+            lc = dict(_leaf_notes)
+        for i in insts:
+            for t in i.get("tasks", []):
+                for leaf in t.get("leaves", []):
+                    raw = (leaf.get("prompt") or leaf.get("title") or "").strip()
+                    leaf["rawTitle"] = leaf.get("title") or ""
+                    c = lc.get(leaf["id"])
+                    if c and c.get("h") == _title_hash(raw):
+                        leaf["title"] = c["t"]
+                        leaf["expect"] = c["e"]
+                        leaf["aiNote"] = True
+        with _inspect_lock:
+            ins = dict(_inspect)
+        return {"ts": now, "window_hours": WINDOW_H, "instances": insts, "inspect": ins,
+                "stats": llm_stats()}
 
     def _service_leaf(p):
         cmd = " ".join(p.get("cmd") or [])
         return {
             "id": f"proc:{p['pid']}", "kind": "service", "harness": "service", "mode": "service",
-            "title": clip(redact(cmd), 80), "prompt": "", "command": redact(cmd)[:800],
+            "title": clip(redact(cmd), 80), "prompt": "", "command": redact(cmd)[:CMD_MAX],
             "cwd": p.get("cwd") or "", "startedAt": p.get("start"), "endedAt": None,
             "status": "running", "pid": p["pid"], "doing": None, "lastActivity": None,
             "model": "", "session": "", "conversation": "", "titleHint": "",
@@ -2142,8 +2177,8 @@ def build():
             leaves.append({
                 "id": f"proc:{p['pid']}", "kind": h, "harness": h, "mode": inv.get("mode", "process"),
                 "title": clip(redact(inv.get("title") or inv.get("prompt") or " ".join(p["cmd"][1:]) or h), 80),
-                "prompt": redact(inv.get("prompt") or "")[:3000],
-                "command": redact(" ".join(p["cmd"]))[:800], "cwd": p["cwd"],
+                "prompt": redact(inv.get("prompt") or "")[:PROMPT_MAX],
+                "command": redact(" ".join(p["cmd"]))[:CMD_MAX], "cwd": p["cwd"],
                 "startedAt": p["start"], "endedAt": None,
                 "status": "stalled" if is_idle_worker(p, now) else "running", "pid": p["pid"],
                 "doing": None, "lastActivity": None, "model": inv.get("model", ""),
