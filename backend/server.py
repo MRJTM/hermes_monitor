@@ -1231,7 +1231,7 @@ def collect_instance(inst, procs, now, used_procs=None):
                 "conversation": inv.get("conversation", ""), "titleHint": inv.get("title", ""),
             }
             enrich_leaf(leaf, [], set(), now)
-            leaf.update(pid=p["pid"], status="running", procStart=p["start"])
+            leaf.update(pid=p["pid"], procStart=p["start"])   # 保留 enrich 的 stalled 判定，不硬改 running
             used_procs.add(p["pid"])
             leaves.append(leaf)
         target = next((t for t in tasks if t.get("status") == "running"), None)
@@ -1246,12 +1246,22 @@ def collect_instance(inst, procs, now, used_procs=None):
                           "lastTs": now, "toolCalls": 0, "final": None, "leaves": leaves})
 
     merge_reports(inst["id"], tasks, now)
-    # 只要还有工人进程在跑，这一轮就不算“已完成”（否则会出现 leaves 全 running、任务却显示 done）
+    # 任务状态修正：
+    #  - 只要还有工人在跑（status=running），这一轮就不能显示“已完成”（否则 leaves 全 running、任务却 done）
+    #  - 工人全部结束（done/failed/stalled）后，任务不能继续显示“运行中”：15 分钟无动静 → 中断
+    #    （旧逻辑把 stalled 也算 live，导致 harness 早就跑完、任务节点却挂几天都显示运行中）
     for t in tasks:
-        live = [l for l in (t.get("leaves") or []) if l.get("status") in ("running", "stalled")]
+        ls = t.get("leaves") or []
+        live = [l for l in ls if l.get("status") == "running"]
         if live and t.get("status") == "done":
             t["status"] = "running"
             t["lastTs"] = now
+        elif t.get("status") == "running" and ls and not live:
+            last = max([l.get("lastActivity") or 0 for l in ls] +
+                       [(l.get("endedAt") or l.get("startedAt") or 0) for l in ls])
+            if now - last > 900:
+                t["status"] = "stalled"
+                t["lastTs"] = max(t.get("lastTs") or 0, last)
     tasks.sort(key=lambda t: t["startedAt"], reverse=True)
     out["tasks"] = tasks
     # 忙 / 休息：有任务或 Claude 在跑 = 忙，忙了多久从最早那个在跑的任务算起；
@@ -1724,8 +1734,17 @@ def save_outcomes():
         print("save outcomes error:", e, file=sys.stderr, flush=True)
 
 
-def find_summary_files(cwd, prompt, limit=3):
-    """在产出目录里找 summary.md：prompt 里提到的路径 + task/*/harness_dispatch/*/summary.md。"""
+def _bigrams(s):
+    s = re.sub(r"\s+", "", s or "")
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+
+def find_summary_files(cwd, prompt, limit=3, inst="", hint=""):
+    """在产出目录里找 summary.md：prompt 里提到的路径 + 本实例 task/**/summary.md。
+
+    台账里的 summary.md 只在和这次派活「字面相关」时才采用（共享 bigram ≥3），
+    否则会把别的任务的 summary 当成本次产出（LLM 会据此给出错误的完成结果）。
+    """
     import glob as _g
     found = []
     for m in re.finditer(r"([\w./~-]*summary\.md)", prompt or ""):
@@ -1735,10 +1754,23 @@ def find_summary_files(cwd, prompt, limit=3):
         if os.path.isfile(p):
             found.append(p)
     for pat in ("task/*/harness_dispatch/*/summary.md", "task/*/summary.md", "task/summary.md"):
-        if not cwd:
-            break
-        cands = sorted(_g.glob(os.path.join(cwd, pat)), key=lambda x: -os.path.getmtime(x))[:2]
-        found.extend(cands)
+        bases = []
+        if cwd:
+            bases.append(cwd)
+        if inst:
+            bases.append(os.path.join(BOT_ROOT, "hermes" if inst == "hermes1" else inst))
+        else:
+            bases += sorted(_g.glob(os.path.join(BOT_ROOT, "hermes*")))
+        hb = _bigrams((hint or prompt or "")[:300])
+        for base in bases:
+            cands = sorted(_g.glob(os.path.join(base, pat)), key=lambda x: -os.path.getmtime(x))[:2]
+            for c in cands:
+                if base == cwd or not hb:
+                    found.append(c)
+                    continue
+                txt = (_read(c) or "")[:4000]
+                if len(hb & _bigrams(txt)) >= 3:
+                    found.append(c)
     out, seen = [], set()
     for p in found:
         if p in seen:
@@ -1767,7 +1799,7 @@ def summarize_outcomes():
                     continue
                 sig = _title_hash(raw + "|" + (l.get("result") or "")[:400])
                 if cache["leaves"].get(l.get("id"), {}).get("h") != sig:
-                    todo.append(("leaf", l.get("id"), sig, l))
+                    todo.append(("leaf", l.get("id"), sig, l, i.get("id")))
             continue
 
         for t in i.get("tasks", []):
@@ -1780,9 +1812,9 @@ def summarize_outcomes():
             sig = _title_hash((t.get("rawTitle") or "") + "|" + ",".join(
                 (l.get("id") or "") for l in t.get("leaves") or []))
             if cache["tasks"].get(key, {}).get("h") != sig:
-                todo.append(("task", key, sig, t))
+                todo.append(("task", key, sig, t, i.get("id")))
     n = 0
-    for kind, key, sig, obj in todo[:6]:
+    for kind, key, sig, obj, iid in todo[:6]:
         try:
             if kind == "leaf":
                 ev = ["初始派活 prompt：\n" + (obj.get("prompt") or "")[:3000]]
@@ -1797,7 +1829,8 @@ def summarize_outcomes():
                     if txt:
                         ev.append("执行日志尾部（%s）：\n%s" % (os.path.basename(lp), txt[-2000:]))
                         break
-                mds = find_summary_files(obj.get("cwd") or "", obj.get("prompt") or "")
+                mds = find_summary_files(obj.get("cwd") or "", obj.get("prompt") or "", inst=iid,
+                                         hint=(obj.get("title") or "") + " " + (obj.get("prompt") or "")[:300])
                 for p in mds:
                     t = _read(p) or ""
                     if t:
@@ -2269,6 +2302,72 @@ def save_seen_nodes():
         pass
 
 
+_model_cache = {}
+
+
+def _read_json(p):
+    try:
+        with open(os.path.expanduser(p)) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def default_model_of(h, command=""):
+    """harness 没显式 -m 时，读它自己的配置，得到这一趟实际生效的模型名。"""
+    h = h or "claude"
+    m = re.search(r"CLAUDE_CONFIG_DIR=([^\s;&|]+)", command or "")
+    home = m.group(1).strip("\"'") if m else ""
+    if h == "claude":
+        path = os.path.join(home or os.path.expanduser("~/.claude"), "settings.json")
+    elif h == "opencode":
+        path = os.path.expanduser(os.environ.get("OPENCODE_CONFIG") or "~/.config/opencode/opencode.json")
+    elif h == "antigravity":
+        path = os.path.expanduser("~/.gemini/antigravity-cli/settings.json")
+    else:
+        return ""
+    try:
+        mt = os.path.getmtime(path)
+    except Exception:
+        return ""
+    key = (h, path)
+    if _model_cache.get(key, (None, None))[0] == mt:
+        return _model_cache[key][1]
+    d = _read_json(path) or {}
+    name = ""
+    if h == "claude":
+        env = d.get("env") or {}
+        name = env.get("ANTHROPIC_MODEL") or d.get("model") or ""
+    elif h == "opencode":
+        name = d.get("model") or ""
+        name = name.split("/", 1)[-1] if name.startswith("modelhub/") else name
+        if not name:
+            prov = (d.get("provider") or {})
+            name = next(iter(prov), "")
+    else:
+        name = d.get("model") or ""
+    _model_cache[key] = (mt, name)
+    return name
+
+
+def _model_from_cmd(cmd, h):
+    """只从 harness 自己的命令行里取 -m/--model，避免把外层 `python3 -m pytest` 当成模型。"""
+    pats = {"claude": r"\bclaude\b", "opencode": r"\b(?:opencode|ocd)\b", "antigravity": r"\bagy\b"}
+    idx = len(cmd or "")
+    for pat in pats.values():
+        mm = re.search(pat, cmd or "")
+        if mm:
+            idx = min(idx, mm.start())
+    tail = (cmd or "")[idx:]
+    tail = re.split(r"[;\n]|&&|\|\||\|", tail, maxsplit=1)[0]   # 只看启动 harness 那一段
+    m = re.search(r"(?:^|\s)(?:-m|--model)[ =]([\w./:-]+)", tail)
+    return m.group(1) if m else ""
+
+
+def _model_slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
+
+
 def decorate_leaves(insts):
     """给叶子补 brief（一句话简介）、turns（与同一 harness 的轮次）、outcome（完成结果）。"""
     with _outcome_lock:
@@ -2279,14 +2378,15 @@ def decorate_leaves(insts):
             plans = {}
             for leaf in t.get("leaves", []):
                 p = leaf.get("plan") or {}
-                if (p.get("brief") or "").strip():
-                    leaf["brief"] = clip(p["brief"].strip(), 44)
-                what = (p.get("what") or "").strip()
-                res = (p.get("result") or "").strip()
-                if (what or res) and not leaf.get("brief"):
-                    leaf["brief"] = clip((what + (("　→　" + res) if res else "")).strip(), 90)
-                if leaf.get("expect") and not leaf.get("brief"):
-                    leaf["brief"] = clip("期待：" + str(leaf["expect"]), 90)
+                brief = (leaf.get("brief") or p.get("brief") or "").strip()
+                if not brief:
+                    # 旧缓存只有 title/expect：本地合成「做什么 → 期望结果」，不额外花 LLM
+                    what = (p.get("what") or leaf.get("title") or "").strip()
+                    res = (p.get("result") or leaf.get("expect") or "").strip()
+                    brief = (what + (" → " + res if res and res not in what else "")) if what else \
+                        ("期待：" + res if res else "")
+                if brief:
+                    leaf["brief"] = clip(brief, 60)
             # 同一 harness 在本任务里被派了几次 = 轮次
             h = {}
             for leaf in t.get("leaves", []):
@@ -2295,8 +2395,14 @@ def decorate_leaves(insts):
             for leaf in t.get("leaves", []):
                 leaf["turns"] = h.get(leaf.get("harness") or "claude", 1)
                 if not leaf.get("model"):
-                    m = re.search(r"(?:-m|--model)[ =]([\w./:-]+)", leaf.get("command") or "")
-                    leaf["model"] = m.group(1) if m else "默认"
+                    hh = leaf.get("harness") or "claude"
+                    leaf["model"] = _model_from_cmd(leaf.get("command") or "", hh) or \
+                        default_model_of(hh, leaf.get("command") or "") or "默认"
+                else:
+                    hh = leaf.get("harness") or "claude"
+                    disp = default_model_of(hh, leaf.get("command") or "")
+                    if disp and _model_slug(disp) == _model_slug(leaf["model"]):
+                        leaf["model"] = disp
                 o = oc_l.get(leaf.get("id"))
                 if o and o.get("text"):
                     leaf["outcome"] = o["text"]
