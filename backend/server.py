@@ -138,6 +138,47 @@ def proc_table():
     return out
 
 
+_SESSION_META = {}
+
+
+def proc_session_meta(p):
+    """判断一个进程是不是「人手动开的终端会话」：有 /dev/pts 控制终端或在 tmux 里。"""
+    key = (p["pid"], round(p.get("start") or 0, 1))
+    if key in _SESSION_META:
+        return _SESSION_META[key]
+    meta = {"tty": "", "tmux": False}
+    try:
+        meta["tty"] = os.readlink(f"/proc/{p['pid']}/fd/0")
+    except Exception:
+        pass
+    try:
+        with open(f"/proc/{p['pid']}/environ", "rb") as f:
+            meta["tmux"] = b"TMUX=" in f.read()
+    except Exception:
+        pass
+    if len(_SESSION_META) > 4000:
+        _SESSION_META.clear()
+    _SESSION_META[key] = meta
+    return meta
+
+
+def is_human_session(p):
+    """有 pts 控制终端或跑在 tmux 里 → 用户自己开的交互会话，不是 Hermes 派发的工人。"""
+    m = proc_session_meta(p)
+    return m["tmux"] or m["tty"].startswith("/dev/pts/")
+
+
+def is_harness_payload(p, procs):
+    """wrapper/守护进程剔除：shim.js、以及「父进程本身就是工人」的子进程（opencode serve/acp）。"""
+    base = os.path.basename((p.get("cmd") or [""])[0]) if p.get("cmd") else ""
+    if base in ("node", "nodejs") and any("shim.js" in c for c in (p.get("cmd") or [])):
+        return False
+    for a in ancestors(p["pid"], procs)[1:]:
+        if a in procs and is_harness_proc(procs[a]):
+            return False
+    return True
+
+
 def ancestors(pid, table):
     seen = []
     while pid and pid in table and pid not in seen and len(seen) < 40:
@@ -1991,13 +2032,17 @@ def build():
             insts.append({"id": inst["id"], "name": inst.get("label") or inst["id"], "home": inst["home"],
                           "alive": False, "tasks": [], "error": f"{type(e).__name__}: {e}"})
     # 任何实例都没认领的存活工人进程（手工在 shell / tmux 里起的 opencode、claude…）
-    leftovers = [p for p in procs.values() if is_harness_proc(p) and p["pid"] not in used]
-    if leftovers:
+    leftovers = [p for p in procs.values()
+                 if is_harness_proc(p) and p["pid"] not in used and is_harness_payload(p, procs)]
+    human = [p for p in leftovers if is_human_session(p)]
+    leftovers = [p for p in leftovers if p not in human]
+
+    def _mk_node(node_id, name, title, procs_list):
         leaves = []
-        for p in leftovers:
+        for p in procs_list:
             h = harness_of_proc(p) or "claude"
             inv = find_harness_invocation(" ".join(p["cmd"])) or {"mode": "process", "prompt": ""}
-            leaf = {
+            leaves.append({
                 "id": f"proc:{p['pid']}", "kind": h, "harness": h, "mode": inv.get("mode", "process"),
                 "title": clip(redact(inv.get("title") or inv.get("prompt") or " ".join(p["cmd"][1:]) or h), 80),
                 "prompt": redact(inv.get("prompt") or "")[:3000],
@@ -2005,18 +2050,26 @@ def build():
                 "startedAt": p["start"], "endedAt": None, "status": "running", "pid": p["pid"],
                 "doing": None, "lastActivity": None, "model": inv.get("model", ""),
                 "session": inv.get("session", ""), "conversation": "", "titleHint": inv.get("title", ""),
-            }
-            leaves.append(leaf)
+            })
             used.add(p["pid"])
+        if not leaves:
+            return
         insts.append({
-            "id": "unattributed", "name": "未归属工人", "home": "", "alive": True,
-            "pid": None, "gateway_state": "running", "active_agents": len(leaves), "error": None,
+            "id": node_id, "name": name, "home": "", "alive": True, "pid": None,
+            "gateway_state": "running", "active_agents": len(leaves), "error": None,
             "state": "busy", "busy_since": min(l["startedAt"] for l in leaves), "rest_since": None,
-            "tasks": [{"id": "unattributed:orphan", "title": "后台 / 未归属的工人进程（不在任何 Hermes 实例下）",
-                       "text": "", "session": "", "chat": "", "chatType": "", "source": "process",
-                       "status": "running", "startedAt": min(l["startedAt"] for l in leaves),
-                       "endedAt": None, "lastTs": now, "toolCalls": 0, "final": None, "leaves": leaves}],
+            "tasks": [{"id": f"{node_id}:orphan", "title": title, "text": "", "session": "", "chat": "",
+                       "chatType": "", "source": "process", "status": "running",
+                       "startedAt": min(l["startedAt"] for l in leaves), "endedAt": None,
+                       "lastTs": now, "toolCalls": 0, "final": None, "leaves": leaves}],
         })
+
+    if human:
+        _mk_node("human-sessions", "人工终端会话",
+                 "人工终端会话（你自己在 pts / tmux 里开的 opencode / claude / agy，不是 Hermes 派发）", human)
+    if leftovers:
+        _mk_node("unattributed", "未归属工人",
+                 "后台 / 未归属的工人进程（无终端、非 tmux，可能是 Hermes 派发但没认领到）", leftovers)
     with _titles_lock:
         tc = dict(_titles)
     for i in insts:
