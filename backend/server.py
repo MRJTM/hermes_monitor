@@ -1622,6 +1622,7 @@ SHOW_INFRA = os.environ.get("SHOW_INFRA", "0") not in ("0", "", "false", "False"
 INSPECT_FILE = os.path.join(DATA_DIR, "inspect.json")
 INSPECT_SIG_FILE = os.path.join(DATA_DIR, "inspect_sig.json")
 LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:4000/v1/chat/completions")
+LLM_FALLBACK_MODEL = os.environ.get("LLM_FALLBACK_MODEL", "gemini-4-argon")
 LLM_MODEL = os.environ.get("LLM_MODEL", "ali-deepseek-v4.1-flash-nothink")
 LLM_KEY = os.environ.get("LLM_KEY", "")  # 只从 .env 读，源码里不留任何字面量 key
 _inspect = {"ts": 0, "text": "", "model": LLM_MODEL, "error": None}
@@ -1643,11 +1644,11 @@ _leaf_notes = {}
 _leaf_lock = threading.Lock()
 
 
-def llm_chat(prompt, max_tokens=1200, temperature=0.3, timeout=90):
+def llm_chat(prompt, max_tokens=1200, temperature=0.3, timeout=90, model=None):
     if not LLM_KEY:
         raise RuntimeError("LLM_KEY 未配置：请在 .env 里设置 LLM_KEY")
     body = json.dumps({
-        "model": LLM_MODEL,
+        "model": model or LLM_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature, "max_tokens": max_tokens, "reasoning_effort": "none",
     }).encode()
@@ -1655,7 +1656,14 @@ def llm_chat(prompt, max_tokens=1200, temperature=0.3, timeout=90):
         "Content-Type": "application/json", "Authorization": "Bearer " + LLM_KEY})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         o = json.loads(r.read())
-    text = ((o.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    msg = ((o.get("choices") or [{}])[0].get("message") or {})
+    text = msg.get("content") or ""
+    if not text.strip():
+        # 推理模型（deepseek 等）可能把预算全用在 reasoning 上：退而用 reasoning 里的 JSON 片段
+        text = msg.get("reasoning_content") or msg.get("reasoning") or ""
+        m = re.search(r"\[[\s\S]*\]|\{[\s\S]*\}", text)
+        text = m.group(0) if m else ""
+    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
     if not text.strip():
         raise ValueError("模型返回空内容")
     return text.strip()
@@ -1776,34 +1784,90 @@ def summarize_leaf_notes():
         meta.setdefault(raw, l.get("harness") or l.get("kind") or "claude")
     if not groups:
         return 0
-    raws = list(groups)[:10]
+    raws = list(groups)[:4]
     listing = "\n".join(f"{i+1}. [{meta[r]}] {clip(r, 400)}" for i, r in enumerate(raws))
-    prompt = ("下面是派给 AI 工人的任务清单（编号 + 工人类型 + 任务原文）。\n"
-              "请为每条总结两点：\n"
-              "1) 任务名：不超过 14 个汉字，动宾结构，突出对象和动作；\n"
-              "2) 期待的结果：不超过 32 个汉字，写清应交付的产物或验收标准（原文没写就写合理的验收标准）。\n"
-              "不要照抄原文，不要 @人名、引号、编号，不要解释。\n"
-              "只输出 JSON 数组，每项是 [\"任务名\", \"期待的结果\"]，顺序与输入一致。\n\n"
-              + listing)
+    prompt = ("下面是派给 AI 工人的任务原文（编号 + 工人类型 + 原文）。请对每条做结构化解析：\n"
+              "1) title：任务名，≤14 个汉字，动宾结构，突出对象和动作；\n"
+              "2) context：任务背景/前提（≤40 汉字，原文没写就写\"未说明\"）；\n"
+              "3) what：要做什么（≤40 汉字）；\n"
+              "4) how：大概怎么做（≤40 汉字，只要方式/思路，不写具体命令）；\n"
+              "5) result：期望的结果/交付物及存放位置（≤40 汉字）；\n"
+              "6) expect：验收标准（≤32 汉字，原文没写就写合理标准）。\n"
+              "用中文，不要照抄长句，不要 @人名/引号，不要任何解释或思考过程。\n"
+              "输出格式（严格一行一条，用 | 分隔 6 个字段，顺序与输入一致）：\n"
+              "序号|任务名|上下文|要做什么|大概怎么做|期望结果|验收标准\n"
+              "例如：1|修登录超时|线上偶发登录失败|定位并修复超时|先看日志再改重试|超时率降到 0|p99<2s\n\n" + listing)
     try:
-        text = llm_chat(prompt, max_tokens=1500, temperature=0.2, timeout=90)
+        text = llm_chat(prompt, max_tokens=2600, temperature=0.2, timeout=120)
     except Exception as e:
         print("leaf llm error:", e, file=sys.stderr, flush=True)
         return 0
-    got = _parse_pairs(text, len(raws))
+    got = _parse_pipe(text, len(raws)) or _parse_objs(text, len(raws))
+    if len(got) < len(raws) and LLM_FALLBACK_MODEL:
+        try:
+            text2 = llm_chat(prompt, max_tokens=1800, temperature=0.0, timeout=120,
+                             model=LLM_FALLBACK_MODEL)
+            got2 = _parse_pipe(text2, len(raws)) or _parse_objs(text2, len(raws))
+            if len(got2) > len(got):
+                got, text = got2, text2
+        except Exception as e:
+            print("leaf fallback llm error:", e, file=sys.stderr, flush=True)
     if len(got) < len(raws):
         print("leaf parse short:", len(got), "/", len(raws), repr(text[:200]), file=sys.stderr, flush=True)
     n = 0
     with _leaf_lock:
-        for raw, (title, expect) in zip(raws, got):
-            if not title:
+        for raw, title in zip(raws, got):
+            if not (isinstance(title, dict) and title.get("title")):
                 continue
             for lid in groups[raw]:
-                _leaf_notes[lid] = {"h": _title_hash(raw), "t": title, "e": expect, "ts": int(time.time())}
+                _leaf_notes[lid] = {"h": _title_hash(raw), "t": (title.get("title") or "").strip(),
+                                    "e": (title.get("expect") or "").strip(), "p": title,
+                                    "ts": int(time.time())}
                 n += 1
     if n:
         save_leaf_notes()
     return n
+
+
+def _parse_pipe(text, n):
+    """解析 "序号|任务名|上下文|要做什么|大概怎么做|期望结果|验收标准" 行。"""
+    out = []
+    for line in (text or "").splitlines():
+        line = line.strip().strip("`").strip()
+        if "|" not in line:
+            continue
+        parts = [x.strip().strip('"') for x in line.split("|")]
+        if len(parts) < 6:
+            continue
+        if parts[0].isdigit() or (parts[0].startswith("[") and parts[0].endswith("]")):
+            parts = parts[1:]
+        if len(parts) < 5:
+            continue
+        parts = parts[:6]
+        keys = ("title", "context", "what", "how", "result", "expect")
+        d = {k: _clean_title(v) for k, v in zip(keys, parts)}
+        out.append(d)
+        if len(out) >= n:
+            break
+    return out
+
+
+def _parse_objs(text, n):
+    """解析 [{title, context, what, how, result, expect}, ...]；失败则退化成 [title, expect] 对。"""
+    t = (text or "").replace("【", "[").replace("】", "]").replace("“", '"').replace("”", '"')
+    m = re.search(r"\[.*\]", t, re.S)
+    if m:
+        try:
+            arr = json.loads(m.group(0))
+            if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+                out = []
+                for o in arr[:n]:
+                    out.append({k: _clean_title(o.get(k, "")) for k in ("title", "context", "what", "how", "result", "expect")})
+                return out
+        except Exception:
+            pass
+    pairs = _parse_pairs(text, n)
+    return [{"title": a, "expect": b, "context": "", "what": "", "how": "", "result": ""} for a, b in pairs]
 
 
 def _need_title(raw):
@@ -1901,6 +1965,23 @@ def summarize_titles():
     return n
 
 
+def pending_leaf_notes(snap):
+    """还有哪些工人的「结构化解析」没做过（缓存缺失或原文变了）。"""
+    with _leaf_lock:
+        cache = dict(_leaf_notes)
+    n = 0
+    for i in (snap or {}).get("instances", []):
+        for t in i.get("tasks", []):
+            for l in t.get("leaves", []):
+                raw = (l.get("prompt") or l.get("title") or "").strip()
+                if not need_leaf_note(raw):
+                    continue
+                c = cache.get(l.get("id"), {})
+                if c.get("h") != _title_hash(raw) or not c.get("p"):
+                    n += 1
+    return n
+
+
 def title_loop():
     """标题 / 工人摘要：只在出现新节点时调 LLM，其余轮次纯本地扫表。
 
@@ -1920,7 +2001,8 @@ def title_loop():
             with _seen_lock:
                 new_keys = keys - _seen_nodes
             now = time.time()
-            if not new_keys:
+            pending = pending_leaf_notes(snap)
+            if not new_keys and pending == 0:
                 _LLM_STATS["title_skipped"] += 1
                 _LLM_STATS["title_reason"] = "no-new-node"
             elif now - last_call < TITLE_MIN_INTERVAL_S:
@@ -1938,7 +2020,7 @@ def title_loop():
                     print("leaf loop error:", e, file=sys.stderr, flush=True)
                 last_call = _LLM_STATS["title_call_ts"] = time.time()
                 _LLM_STATS["title_calls"] += 1
-                _LLM_STATS["title_reason"] = "new-node(%d)" % len(new_keys)
+                _LLM_STATS["title_reason"] = ("new-node(%d)" % len(new_keys)) if new_keys else ("pending(%d)" % pending)
                 with _seen_lock:
                     _seen_nodes.update(keys)
                 save_seen_nodes()
@@ -2158,6 +2240,7 @@ def build():
                         leaf["title"] = c["t"]
                         leaf["expect"] = c["e"]
                         leaf["aiNote"] = True
+                        leaf["plan"] = c.get("p")
         with _inspect_lock:
             ins = dict(_inspect)
         return {"ts": now, "window_hours": WINDOW_H, "instances": insts, "inspect": ins,
@@ -2280,6 +2363,7 @@ def build():
                     leaf["title"] = c["t"]
                     leaf["expect"] = c["e"]
                     leaf["aiNote"] = True
+                    leaf["plan"] = c.get("p")
                 elif not leaf.get("reported"):
                     if leaf.get("harness") == "service":
                         leaf.setdefault("title", "服务进程")

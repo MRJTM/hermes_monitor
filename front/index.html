@@ -417,9 +417,20 @@ function openSide(n, kind, now) {
       <h3>用户请求原文</h3><pre>${esc(n.text || n.rawTitle || n.title)}</pre>${n.final ? `<h3>Hermes 最终回复</h3><pre>${esc(n.final)}</pre>` : ""}`;
   } else if (kind === "leaf") {
     h += `<div class="kv"><span>工人</span><span>${esc(HARN[n.harness || n.kind] || n.harness || n.kind || "Claude")}${n.model ? " · " + esc(n.model) : ""}</span><span>模式</span><span>${esc(n.mode)}</span><span>目录</span><span>${esc(n.cwd || "—")}</span><span>启动</span><span>${full(n.startedAt)}</span><span>${n.status === "running" ? "已运行" : "结束"}</span><span>${n.status === "running" ? dur(now - n.startedAt) : full(n.endedAt)}</span>${n.pid ? `<span>PID</span><span>${n.pid}（进程存活）</span>` : ""}${n.lastActivity ? `<span>最近动静</span><span>${dur(now - n.lastActivity)}前</span>` : ""}${n.tokens ? `<span>tokens</span><span>${n.tokens}</span>` : ""}</div>`;
-    h += n.aiNote
-      ? `<h3>AI 概览</h3><div class="kv"><span>任务</span><span>${esc(n.title)}</span><span>期望产出</span><span>${esc(n.expect || "—")}</span></div>`
-      : `<h3>AI 概览</h3><p style="color:var(--muted)">后台 Agent 正在总结这个工人任务…</p>`;
+    if (n.aiNote && n.plan) {
+      const P = n.plan;
+      h += `<h3>AI 解析（基于初始派活 prompt）</h3><div class="kv">
+        <span>任务</span><span>${esc(P.title || n.title)}</span>
+        <span>上下文</span><span>${esc(P.context || "—")}</span>
+        <span>要做什么</span><span>${esc(P.what || "—")}</span>
+        <span>大概怎么做</span><span>${esc(P.how || "—")}</span>
+        <span>期望结果</span><span>${esc(P.result || "—")}</span>
+        <span>验收标准</span><span>${esc(P.expect || n.expect || "—")}</span></div>`;
+    } else if (n.aiNote) {
+      h += `<h3>AI 概览</h3><div class="kv"><span>任务</span><span>${esc(n.title)}</span><span>期望产出</span><span>${esc(n.expect || "—")}</span></div>`;
+    } else {
+      h += `<h3>AI 解析</h3><p style="color:var(--muted)">后台 Agent 正在解析这个工人任务的初始 prompt…</p>`;
+    }
     if (n.prompt) h += `<h3>派活指令（原文，完整）</h3><pre class="longtext">${esc(n.prompt)}</pre>`;
     if (n.command && n.command !== n.prompt) h += `<h3>执行命令</h3><pre class="longtext">${esc(n.command)}</pre>`;
     if (n.doing) h += `<h3>${n.status === "running" ? "此刻在做" : "最后做的事"}</h3><ul class="steps">${n.doing.recent.map(s => `<li>${esc(s)}</li>`).join("")}</ul>`;
