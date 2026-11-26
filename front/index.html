@@ -167,8 +167,8 @@ const GROUPS = [ // 状态层：顺序即显示顺序
   { key: "stalled", cls: "stall", title: "被中断" },
   { key: "done", cls: "done", title: "已完成" },
 ];
-const W = { root: 196, status: 168, task: 276, leaf: 376 };
-const H = { root: 58, status: 50, task: 66, leaf: 120 };
+const W = { root: 196, status: 168, task: 300, leaf: 540 };
+const H = { root: 58, status: 50, task: 66, leaf: 92 };
 const GAPX = 50, GAPY = 12, GROUPGAP = 20, PAD = 14, CAP = 12;
 const state = { snap: null, recvAt: 0, sel: null, fold: {}, more: new Set(), win: 24, onlyRun: false };
 try {
@@ -347,11 +347,11 @@ function renderInstance(inst, now) {
           { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }) : "—";
         nodeBox(nodeG, { x: colX[3], y: r.ly[i], w: W.leaf, h: H.leaf, type: "leaf", icon: h,
           cls: ST[l.status] ? ST[l.status][0] : "stall", sel: state.sel === l.id,
-          lines: [fit((l.reported ? "📡 " : "") + (l.title || "（工人）"), 46),
-                  fit(brief, 44), fit(wrapRest(brief, 44), 44),
-                  fit(`${hn} · ${l.model || "默认"}`, 64),
-                  fit(`${l.turns || 1} 轮 · ${when} 启动 · ${runFor}`, 64)],
-          classes: ["t1", "t2", "t2", "t4", "t4"],
+          lines: [fit((l.reported ? "📡 " : "") + (l.title || "（工人）"), 52),
+                  fit(brief, 62),
+                  fit(`${hn} · ${l.model || "默认"}`, 62),
+                  fit(`${l.turns || 1} 轮 · ${when} 启动 · ${runFor}`, 62)],
+          classes: ["t1", "t2", "t3", "t3"],
           onClick: () => { state.sel = l.id; openSide(l, "leaf", now); render(); } });
       });
     });
