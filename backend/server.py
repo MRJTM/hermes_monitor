@@ -1801,6 +1801,8 @@ def summarize_titles():
     with _titles_lock:
         cache = dict(_titles)
     for t in tasks:
+        if t.get("noTitle"):
+            continue
         raw = t.get("rawTitle") or t.get("title") or ""
         if not _need_title(raw):
             continue
@@ -2085,8 +2087,12 @@ def build():
 
     # 基础设施进程（happy 桥 / 模型网关 / opencode serve、acp）：能按 -p / cwd 归到实例的就归过去
     svc_free = []
+    svc_pids = [q["pid"] for q in procs.values() if is_service_proc(q)]
     for p in procs.values():
         if p["pid"] in used or not is_service_proc(p):
+            continue
+        if any(a in svc_pids and a != p["pid"] for a in ancestors(p["pid"], procs)[1:]):
+            used.add(p["pid"])
             continue
         used.add(p["pid"])
         owner = service_owner(p, inst_ids)
@@ -2099,7 +2105,8 @@ def build():
                             break
                     else:
                         i.setdefault("tasks", []).append({
-                            "id": f"{owner}:service", "title": "服务进程（happy 桥 / 模型网关）", "text": "",
+                            "id": f"{owner}:service", "noTitle": True,
+                            "title": "常驻服务（非任务：happy 桥 / 模型网关）", "text": "",
                             "session": "", "chat": "", "chatType": "", "source": "process", "status": "running",
                             "startedAt": p.get("start"), "endedAt": None, "lastTs": now, "toolCalls": 0,
                             "final": None, "leaves": [_service_leaf(p)]})
@@ -2113,7 +2120,8 @@ def build():
             "id": "services", "name": "基础设施进程", "home": "", "alive": True, "pid": None,
             "gateway_state": "running", "active_agents": len(leaves), "error": None, "state": "rest",
             "busy_since": None, "rest_since": min(l["startedAt"] for l in leaves),
-            "tasks": [{"id": "services:all", "title": "服务进程（不属于任何任务：模型网关 / happy 桥 / serve）",
+            "tasks": [{"id": "services:all", "noTitle": True,
+                       "title": "常驻服务（非任务：模型网关 / happy 桥 / serve）",
                        "text": "", "session": "", "chat": "", "chatType": "", "source": "process",
                        "status": "done", "startedAt": min(l["startedAt"] for l in leaves), "endedAt": None,
                        "lastTs": now, "toolCalls": 0, "final": None, "leaves": leaves}],
@@ -2166,6 +2174,8 @@ def build():
         for t in i.get("tasks", []):
             raw = t.get("title") or ""
             t["rawTitle"] = raw
+            if t.get("noTitle"):
+                continue
             c = tc.get(t["id"])
             if c and c.get("h") == _title_hash(raw) and c.get("t"):
                 t["title"] = c["t"]
