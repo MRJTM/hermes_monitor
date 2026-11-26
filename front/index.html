@@ -81,6 +81,7 @@
   .node .t1 { font-size: 12.5px; font-weight: 600; }
   .node .t2 { font-size: 11px; fill: var(--muted); }
   .node .t3 { font-size: 10.5px; fill: var(--muted); }
+  .node .t4 { font-size: 9px; fill: var(--muted); letter-spacing: .2px; }
   .node .chev { font-size: 13px; font-weight: 700; fill: var(--muted); }
   /* 四种节点用四种边框 */
   .t-root rect.box { stroke-width: 3.4; }                      /* 根：粗实线 */
@@ -167,7 +168,7 @@ const GROUPS = [ // 状态层：顺序即显示顺序
   { key: "done", cls: "done", title: "已完成" },
 ];
 const W = { root: 196, status: 168, task: 276, leaf: 376 };
-const H = { root: 58, status: 50, task: 66, leaf: 104 };
+const H = { root: 58, status: 50, task: 66, leaf: 120 };
 const GAPX = 50, GAPY = 12, GROUPGAP = 20, PAD = 14, CAP = 12;
 const state = { snap: null, recvAt: 0, sel: null, fold: {}, more: new Set(), win: 24, onlyRun: false };
 try {
@@ -251,9 +252,10 @@ function nodeBox(parent, o) {
     if (cls === "run") el("circle", { class: "ring", cx: bx, cy: h / 2, r: 7.5 }, g);
     el("circle", { class: `badge-${cls}`, cx: bx, cy: h / 2, r: 4.6 }, g);
   }
-  const n = lines.length, step = n >= 4 ? 17 : (n === 3 ? (type === "leaf" ? 19 : 16) : 17),
+  const n = lines.length, step = n >= 4 ? (type === "leaf" ? 16 : 17) : (n === 3 ? (type === "leaf" ? 19 : 16) : 17),
     y0 = h / 2 - ((n - 1) * step) / 2 + 4;
-  lines.forEach((t, i) => { const tx = el("text", { class: ["t1", "t2", "t3"][i], x: bx + 14, y: y0 + i * step }, g); tx.textContent = t; });
+  const CLS = o.classes || ["t1", "t2", "t3"];
+  lines.forEach((t, i) => { const tx = el("text", { class: CLS[i] || "t4", x: bx + 14, y: y0 + i * step }, g); tx.textContent = t; });
   if (chev) { const c = el("text", { class: "chev", x: w - 24, y: h / 2 + 5 }, g); c.textContent = chev; }
   g.addEventListener("click", ev => { ev.stopPropagation(); onClick(); });
   return g;
@@ -343,11 +345,13 @@ function renderInstance(inst, now) {
           : l.endedAt ? "用时 " + dur(l.endedAt - l.startedAt) : dur(now - (l.startedAt || now));
         const when = l.startedAt ? new Date(l.startedAt * 1000).toLocaleString("zh-CN",
           { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }) : "—";
-        const line3 = `[${hn}] ${l.model || "默认"} · ${l.turns || 1} 轮 · ${when} 启动 · ${runFor}`;
         nodeBox(nodeG, { x: colX[3], y: r.ly[i], w: W.leaf, h: H.leaf, type: "leaf", icon: h,
           cls: ST[l.status] ? ST[l.status][0] : "stall", sel: state.sel === l.id,
           lines: [fit((l.reported ? "📡 " : "") + (l.title || "（工人）"), 46),
-                  fit(brief, 48), fit(wrapRest(brief, 48), 48), fit(line3, 54)],
+                  fit(brief, 44), fit(wrapRest(brief, 44), 44),
+                  fit(`${hn} · ${l.model || "默认"}`, 64),
+                  fit(`${l.turns || 1} 轮 · ${when} 启动 · ${runFor}`, 64)],
+          classes: ["t1", "t2", "t2", "t4", "t4"],
           onClick: () => { state.sel = l.id; openSide(l, "leaf", now); render(); } });
       });
     });

@@ -1931,13 +1931,29 @@ def summarize_leaf_notes():
               "5) result：期望的结果/交付物及存放位置（≤40 汉字）；\n"
               "6) expect：验收标准（≤32 汉字，原文没写就写合理标准）。\n"
               "用中文，不要照抄长句，不要 @人名/引号，不要任何解释或思考过程。\n"
-              "输出格式（严格一行一条，用 | 分隔 6 个字段，顺序与输入一致）：\n"
-              "序号|任务名|上下文|要做什么|大概怎么做|期望结果|验收标准\n"
-              "例如：1|修登录超时|线上偶发登录失败|定位并修复超时|先看日志再改重试|超时率降到 0|p99<2s\n\n" + listing)
+              "输出格式（严格一行一条，用 | 分隔 7 个字段，顺序与输入一致）：\n"
+              "序号|任务名|简介|上下文|要做什么|大概怎么做|期望结果|验收标准\n"
+              "其中「简介」是给列表卡片用的一句话：让这个工人做什么 + 期望得到什么结果，"
+              "**不超过 38 个汉字、必须完整表达、不要用省略号**；\n"
+              "例如：1|修登录超时|定位超时根因并把超时率降下来|线上偶发登录失败|定位并修复超时|先看日志再改重试|超时率降到 0|p99<2s\n\n" + listing)
+    text = ""
     try:
+        _LLM_STATS["titles"] += 1
+        _LLM_STATS["calls"] += 1
+        _LLM_STATS["last_call_ts"] = time.time()
         text = llm_chat(prompt, max_tokens=2600, temperature=0.2, timeout=120)
     except Exception as e:
         print("leaf llm error:", e, file=sys.stderr, flush=True)
+    if not (text or "").strip() or len(_parse_pipe(text, len(raws))) < len(raws):
+        try:                                   # 主模型吐空/解析不全 → 备用模型重试一次
+            _LLM_STATS["calls"] += 1
+            text2 = llm_chat(prompt, max_tokens=2000, temperature=0.0, timeout=120,
+                             model=LLM_FALLBACK_MODEL)
+            if (text2 or "").strip():
+                text = text2
+        except Exception as e:
+            print("leaf fallback llm error:", e, file=sys.stderr, flush=True)
+    if not (text or "").strip():
         return 0
     got = _parse_pipe(text, len(raws)) or _parse_objs(text, len(raws))
     if len(got) < len(raws) and LLM_FALLBACK_MODEL:
@@ -1974,15 +1990,17 @@ def _parse_pipe(text, n):
         if "|" not in line:
             continue
         parts = [x.strip().strip('"') for x in line.split("|")]
-        if len(parts) < 6:
+        if len(parts) < 5:
             continue
         if parts[0].isdigit() or (parts[0].startswith("[") and parts[0].endswith("]")):
             parts = parts[1:]
         if len(parts) < 5:
             continue
-        parts = parts[:6]
-        keys = ("title", "context", "what", "how", "result", "expect")
-        d = {k: _clean_title(v) for k, v in zip(keys, parts)}
+        parts = parts[:7]
+        while len(parts) < 7:
+            parts.append("")
+        keys = ("title", "brief", "context", "what", "how", "result", "expect")
+        d = {k: (_clean_brief(v) if k == "brief" else _clean_title(v)) for k, v in zip(keys, parts)}
         out.append(d)
         if len(out) >= n:
             break
@@ -1999,12 +2017,14 @@ def _parse_objs(text, n):
             if isinstance(arr, list) and arr and isinstance(arr[0], dict):
                 out = []
                 for o in arr[:n]:
-                    out.append({k: _clean_title(o.get(k, "")) for k in ("title", "context", "what", "how", "result", "expect")})
+                    out.append({k: _clean_title(o.get(k, "")) for k in
+                                ("title", "brief", "context", "what", "how", "result", "expect")})
                 return out
         except Exception:
             pass
     pairs = _parse_pairs(text, n)
-    return [{"title": a, "expect": b, "context": "", "what": "", "how": "", "result": ""} for a, b in pairs]
+    return [{"title": a, "expect": b, "brief": "", "context": "", "what": "", "how": "", "result": ""}
+            for a, b in pairs]
 
 
 def _need_title(raw):
@@ -2015,6 +2035,11 @@ def _need_title(raw):
         return True
     wide = sum(1 for ch in t if ord(ch) > 0x2E80)
     return (wide + len(t)) > 30 or "\n" in t or "\r" in t or "@" in t or "http" in t.lower()
+
+
+def _clean_brief(t):
+    t = re.sub(r"\s+", " ", str(t or "")).strip().strip("\"'“”‘’《》")
+    return t[:40]
 
 
 def _clean_title(t):
@@ -2254,9 +2279,11 @@ def decorate_leaves(insts):
             plans = {}
             for leaf in t.get("leaves", []):
                 p = leaf.get("plan") or {}
+                if (p.get("brief") or "").strip():
+                    leaf["brief"] = clip(p["brief"].strip(), 44)
                 what = (p.get("what") or "").strip()
                 res = (p.get("result") or "").strip()
-                if what or res:
+                if (what or res) and not leaf.get("brief"):
                     leaf["brief"] = clip((what + (("　→　" + res) if res else "")).strip(), 90)
                 if leaf.get("expect") and not leaf.get("brief"):
                     leaf["brief"] = clip("期待：" + str(leaf["expect"]), 90)
