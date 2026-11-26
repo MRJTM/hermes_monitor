@@ -484,6 +484,12 @@ def find_harness_invocation(command):
                 pos = _positionals(rest, 1)
                 return {"harness": "opencode", "mode": "run", "prompt": pos[0] if pos else "",
                         "model": model, "session": _opt(rest, ("-s", "--session"))}
+            # ocd -m model "..." / ocd "$(cat brief)"：给了任务文本就是一次性任务
+            #   （位置参数可能被 shell 拆成多段，比如 "$(cat x.md)" → ["$(cat", "x.md)"]，这里拼回去）
+            pos = _positionals(rest, 0)
+            if pos:
+                return {"harness": "opencode", "mode": "run", "prompt": " ".join(pos),
+                        "model": model, "session": _opt(rest, ("-s", "--session"))}
             if sub in ("run", "exec"):
                 pos = _positionals(rest, 1)
                 return {"harness": "opencode", "mode": "run", "prompt": pos[0] if pos else "",
@@ -980,6 +986,10 @@ def enrich_leaf(leaf, all_procs, used_procs, now):
                 leaf["status"] = "stalled"
     if leaf.get("prompt") and re.match(r"^\s*\$\(\s*(cat|<)", leaf["prompt"]):
         leaf["prompt"] = redact(resolve_prompt(leaf["prompt"], cwd, leaf.get("command", "")))[:PROMPT_MAX]
+        if not leaf.get("title") or str(leaf["title"]).lstrip().startswith("$("):
+            first = (leaf["prompt"].strip().splitlines() or [""])[0]
+            if first:
+                leaf["title"] = clip(first, 80)
     return leaf
 
 
@@ -1199,6 +1209,12 @@ def collect_instance(inst, procs, now, used_procs=None):
                       "lastTs": now, "toolCalls": 0, "final": None, "leaves": leaves})
 
     merge_reports(inst["id"], tasks, now)
+    # 只要还有工人进程在跑，这一轮就不算“已完成”（否则会出现 leaves 全 running、任务却显示 done）
+    for t in tasks:
+        live = [l for l in (t.get("leaves") or []) if l.get("status") in ("running", "stalled")]
+        if live and t.get("status") == "done":
+            t["status"] = "running"
+            t["lastTs"] = now
     tasks.sort(key=lambda t: t["startedAt"], reverse=True)
     out["tasks"] = tasks
     # 忙 / 休息：有任务或 Claude 在跑 = 忙，忙了多久从最早那个在跑的任务算起；
