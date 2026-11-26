@@ -429,12 +429,19 @@ def split_shell(text):
     return segs
 
 
-def find_harness_invocation(command):
+def _find_harness_invocation_inner(command):
     """命令里若真的在*启动*某个工人（而不是 echo/grep 提到它），返回
     {harness, mode, prompt, model, session?, title?, conversation?}，否则 None。"""
     if not command or not any(k in command for k in ("claude", "opencode", "antigravity", "agy", "ocd", "ccd")):
         return None
+    hd = re.search(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)\n\s*\2\b", command, re.S)
+    heredoc_text = (hd.group(3) or "").strip() if hd else ""
     body = _HEREDOC.sub(" ", command)                      # 去掉 heredoc 正文
+    def _inv(d):
+        if not (d.get("prompt") or "").strip() and heredoc_text:
+            d["prompt"] = heredoc_text
+        return d
+
     for seg in split_shell(body):
         seg = seg.strip()
         if not seg:
@@ -484,17 +491,18 @@ def find_harness_invocation(command):
                 pos = _positionals(rest, 1)
                 return {"harness": "opencode", "mode": "run", "prompt": pos[0] if pos else "",
                         "model": model, "session": _opt(rest, ("-s", "--session"))}
+            if sub in ("run", "exec"):
+                pos = _positionals(rest, 1)
+                return {"harness": "opencode", "mode": "run", "prompt": pos[0] if pos else "",
+                        "model": model, "session": _opt(rest, ("-s", "--session")),
+                        "title": _opt(rest, ("--title",))}
             # ocd -m model "..." / ocd "$(cat brief)"：给了任务文本就是一次性任务
             #   （位置参数可能被 shell 拆成多段，比如 "$(cat x.md)" → ["$(cat", "x.md)"]，这里拼回去）
             pos = _positionals(rest, 0)
             if pos:
                 return {"harness": "opencode", "mode": "run", "prompt": " ".join(pos),
                         "model": model, "session": _opt(rest, ("-s", "--session"))}
-            if sub in ("run", "exec"):
-                pos = _positionals(rest, 1)
-                return {"harness": "opencode", "mode": "run", "prompt": pos[0] if pos else "",
-                        "model": model, "session": _opt(rest, ("-s", "--session")),
-                        "title": _opt(rest, ("--title",))}
+
             return {"harness": "opencode", "mode": "tui", "prompt": "", "model": model,
                     "session": _opt(rest, ("-s", "--session"))}
 
@@ -518,6 +526,16 @@ def find_harness_invocation(command):
     return None
 
 
+
+def find_harness_invocation(command):
+    """对外入口：解析命令，并用 heredoc 正文兜底空 prompt。"""
+    inv = _find_harness_invocation_inner(command)
+    if inv and not (inv.get("prompt") or "").strip():
+        hd = re.search(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n(.*?)\n\s*\2\b", command or "", re.S)
+        if hd:
+            inv["prompt"] = (hd.group(3) or "").strip()
+    return inv
+
 def find_claude_invocation(command):
     """兼容旧调用：只返回 claude 的识别结果。"""
     inv = find_harness_invocation(command)
@@ -527,7 +545,20 @@ def find_claude_invocation(command):
 def resolve_prompt(prompt, cwd, command=""):
     """把 `$(cat ticket.md)` / `$(<file)` 这类 prompt 还原成真正的指令正文。"""
     src = prompt or command or ""
-    m = re.search(r"\$\(\s*cat\s+([^)]+?)\s*\)", src) or re.search(r"\$\(\s*<\s*([^)]+?)\s*\)", src)
+    m = (re.search(r"\$\(\s*cat\s+([^)]+?)\s*\)", src)
+         or re.search(r"\$\(\s*<\s*([^)]+?)\s*\)", src)
+         or re.search(r"\$\{\s*cat\s+([^}]+?)\s*\}", src)
+         or re.search(r"(?:^|[\s;&|])<\s*([^\s;&|<>]+)", src)
+         or re.search(r"--(?:prompt-)?file[= ]\s*([^\s;&|]+)", src)
+         or re.search(r"(?:^|\s)-f\s+([^\s;&|]+\.(?:md|txt|json))", src))
+    # prompt 本身就是个指令文件（ocd /tmp/brief.md）→ 读出来
+    cand = (prompt or "").strip().strip("'\"")
+    if cand and not cand.startswith("$") and len(cand) < 300:
+        fp = cand if os.path.isabs(cand) else os.path.join(cwd or "", cand)
+        if os.path.isfile(fp):
+            txt = _read(fp)
+            if txt:
+                return txt
     if not m:
         return prompt or ""
     p = m.group(1).strip().strip("'\"")
@@ -1203,10 +1234,16 @@ def collect_instance(inst, procs, now, used_procs=None):
             leaf.update(pid=p["pid"], status="running", procStart=p["start"])
             used_procs.add(p["pid"])
             leaves.append(leaf)
-        tasks.append({"id": f"{inst['id']}:orphan", "title": "后台 / 未归属的工人进程", "text": "",
+        target = next((t for t in tasks if t.get("status") == "running"), None)
+        if target is not None:
+            # 有正在进行的对话轮次 → 把没人认领的工人挂到这一轮，便于看出“这一轮派了什么活”
+            target["leaves"] = (target.get("leaves") or []) + leaves
+            target["lastTs"] = now
+        else:
+            tasks.append({"id": f"{inst['id']}:orphan", "title": "后台 / 未归属的工人进程", "text": "",
                       "session": "", "chat": "", "chatType": "", "source": "process", "status": "running",
-                      "startedAt": min(l["startedAt"] for l in leaves), "endedAt": None,
-                      "lastTs": now, "toolCalls": 0, "final": None, "leaves": leaves})
+                          "startedAt": min(l["startedAt"] for l in leaves), "endedAt": None,
+                          "lastTs": now, "toolCalls": 0, "final": None, "leaves": leaves})
 
     merge_reports(inst["id"], tasks, now)
     # 只要还有工人进程在跑，这一轮就不算“已完成”（否则会出现 leaves 全 running、任务却显示 done）
